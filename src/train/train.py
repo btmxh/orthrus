@@ -120,7 +120,7 @@ def train(args):
     if args.liger:
         apply_liger(model, rms_norm=True, swiglu=True, is_main=is_main)
 
-    loss_fn = build_loss_fn(use_liger=args.liger)
+    loss_fn = build_loss_fn(kind=args.loss, use_liger=args.liger)
     model.loss_fn = loss_fn
 
     model = model.to(device)
@@ -163,7 +163,7 @@ def train(args):
                       f"{n_train}/{n_total} tensors")
     log_main(is_main, f"Kernels | gated_delta_rule={kernels['gated_delta_rule']} | "
                       f"causal_conv1d={kernels['causal_conv1d']} | "
-                      f"fused_linear_ce={loss_fn.is_fused}")
+                      f"loss={loss_fn.kind} fused={loss_fn.is_fused}")
     if not kernels["gated_delta_rule_is_fla"]:
         log_main(is_main, "WARNING: gated-delta-rule resolved to the TORCH fallback instead of fla. Correct, but far slower and numerically different.")
     if not kernels["causal_conv1d_is_kernel"]:
@@ -359,6 +359,9 @@ def parse_args():
                    help="Draft-block anchors sampled per sequence. Bounded by "
                         "seq_len - block_size; supervised positions per row are "
                         "num_anchor_blocks x (block_size - 1).")
+    p.add_argument("--loss", choices=["kl", "ce"], default="kl",
+                   help="kl: forward KL to the frozen AR view's distribution (paper). "
+                        "ce: cross-entropy on the data tokens (the paper's ablation).")
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--weight-decay", type=float, default=0.0)
@@ -368,7 +371,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     # Kernels / parallelism
     p.add_argument("--liger", action="store_true", default=True,
-                   help="Apply Liger RMSNorm/SwiGLU + fused linear CE.")
+                   help="Apply Liger RMSNorm/SwiGLU + the fused linear loss (KL or CE).")
     p.add_argument("--no-liger", dest="liger", action="store_false")
     p.add_argument("--fsdp2", action="store_true")
     p.add_argument("--activation-checkpointing", action="store_true")
