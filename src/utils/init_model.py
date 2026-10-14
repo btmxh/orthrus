@@ -1,6 +1,6 @@
 """Build an Orthrus-Qwen3.5 init checkpoint, and sample training anchors.
 
-    python -m src.utils.init_model --base Qwen/Qwen3.5-4B --out <dir> --block-size 16
+    python -m src.utils.init_model --base Qwen/Qwen3.5-4B --out <dir> --block-size 32
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def _load_base_state_dict(model_name_or_path: str) -> dict:
 def init_orthrus(
     base_model_name_or_path: str,
     out_dir: str,
-    block_size: int = 16,
+    block_size: int = 32,
     mask_token_id: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
     force: bool = False,
@@ -218,7 +218,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Build an Orthrus-Qwen3.5 init checkpoint.")
     parser.add_argument("--base", type=str, default="Qwen/Qwen3.5-4B")
     parser.add_argument("--out", type=str, required=True)
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=32,
+                        help="Parallel block size K; the paper uses 32 at every scale.")
     parser.add_argument("--mask-token-id", type=int, default=None)
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["float32", "float16", "bfloat16"])
