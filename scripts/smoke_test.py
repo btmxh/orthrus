@@ -15,7 +15,9 @@ Builds what it needs if missing (truncated init checkpoint, small packed cache),
   3. Resume: a planted partial step-* dir is skipped by --auto-resume and pruned.
   4. Checkpoint: step-* dirs hold only the twins (equal to final's at the same step); final
      has twins in fp32, all updated, and frozen weights bit-identical to init.
-  5. Inference: the final checkpoint loads and runs a full diffusion block.
+  5. Inference on the final checkpoint: the generation cache matches a full recompute
+     (also across a partial commit) and the uncached diffusion draft; greedy generate()
+     is lossless (each token a full-recompute argmax up to bf16 ties); sampling runs.
 """
 
 from __future__ import annotations
@@ -275,36 +277,94 @@ def check_checkpoint(args) -> None:
     log(f"  {step_dir.name}: twins only ({size_mb:.0f} MB), identical to final")
 
 
-def check_inference(final_dir: str) -> None:
+def check_inference(final_dir: str, cache_dir: str, init_dir: str) -> None:
+    import datasets
     import torch
     from transformers import AutoTokenizer
 
+    from src.models.generation_qwen3_5 import HybridCache
     from src.models.modeling_orthrus_qwen3_5 import OrthrusQwen3_5ForCausalLM
 
     tokenizer = AutoTokenizer.from_pretrained(final_dir)
     model = OrthrusQwen3_5ForCausalLM.from_pretrained(
         final_dir, dtype=torch.bfloat16, attn_implementation="flash_attention_2"
     ).cuda().eval()
-    prompt = tokenizer.apply_chat_template(
-        [{"role": "user", "content": "What is the capital of France?"}],
-        tokenize=True, add_generation_prompt=True, return_dict=True,
-    )["input_ids"]
-    input_ids = torch.tensor([prompt], device="cuda")
-    with torch.no_grad():
-        ar_logits = model(input_ids=input_ids, diffusion_train=False)
-        diff_logits, block_tokens = model(input_ids=input_ids, diffusion_train=False,
-                                          is_diffusion_pass=True, return_block_tokens=True)
+    inner = model.model
     block_size = model.config.block_size
-    assert ar_logits.shape[:2] == (1, input_ids.shape[1])
-    assert diff_logits.shape[:2] == (1, block_size), diff_logits.shape
-    assert torch.isfinite(ar_logits).all() and torch.isfinite(diff_logits).all()
-    num_seeds = model.config.mtp_seed_tokens
-    assert int(block_tokens[0, 0]) == prompt[-1]
-    assert (block_tokens[0, 1 + num_seeds :] == model.config.mask_token_id).all()
-    if num_seeds:
-        assert (block_tokens[0, 1 : 1 + num_seeds] != model.config.mask_token_id).all()
-    log(f"  AR logits {tuple(ar_logits.shape)}, diffusion block {tuple(diff_logits.shape)}, "
-        f"block = anchor + {num_seeds} MTP drafts + masks")
+    failures = []
+
+    def rel_err(got, ref):
+        return ((got.float() - ref.float()).norm() / ref.float().norm()).item()
+
+    def expect_close(name, err, tol=0.05):
+        log(f"  {name}: rel err = {err:.4f}")
+        if err > tol:
+            failures.append(f"{name} (rel err {err:.4f})")
+
+    def full_logits(seq):
+        return model(input_ids=seq, diffusion_train=False)
+
+    text = torch.tensor([datasets.load_from_disk(cache_dir)[0]["input_ids"][:400]], device="cuda")
+    with torch.inference_mode():
+        # Generation cache vs full recompute, across a partial commit (rejected drafts must
+        # not reach the delta-net state or the attention K/V).
+        cache = HybridCache(model)
+        logits = model.lm_head(inner.forward_cached(text[:, :300], cache))
+        cache.commit(300)
+        expect_close("cache: prefill vs full", rel_err(logits, full_logits(text[:, :300])))
+        inner.forward_cached(text[:, 300:316], cache)
+        cache.commit(5)                                        # 11 tokens rolled back
+        logits = model.lm_head(inner.forward_cached(text[:, 340:356], cache))
+        cache.commit(16)
+        ref = full_logits(torch.cat([text[:, :305], text[:, 340:356]], dim=1))[:, 305:]
+        expect_close("cache: after partial commit vs full", rel_err(logits, ref))
+        prefix = torch.cat([text[:, :305], text[:, 340:356], text[:, 360:361]], dim=1)
+        expect_close("cache: diffusion draft vs uncached",
+                     rel_err(inner.diffusion_draft(text[:, 360:361], cache, block_size),
+                             inner.diffusion_block_forward(prefix)))
+
+        # Lossless greedy decoding: every generated token must be the argmax of a full
+        # recompute up to bf16 ties (exact equality with plain AR decoding is too strict:
+        # block-shaped verification flips near-ties). The init checkpoint (twins == AR)
+        # accepts drafts, so partially accepted blocks are covered too.
+        prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "What is the capital of France?"}],
+            add_generation_prompt=True, return_tensors="pt", return_dict=True,
+        )["input_ids"].cuda()
+        init_model = OrthrusQwen3_5ForCausalLM.from_pretrained(
+            init_dir, dtype=torch.bfloat16, attn_implementation="flash_attention_2"
+        ).cuda().eval()
+        for name, candidate in (("final", model), ("init", init_model)):
+            for use_diffusion in (False, True):
+                out, stats = candidate.generate(prompt, max_new_tokens=96, return_stats=True,
+                                                use_diffusion_mode=use_diffusion)
+                hidden = candidate.model(input_ids=out).last_hidden_state.float()
+                pred = (hidden @ candidate.lm_head.weight.float().T)[0, prompt.shape[1] - 1 : -1]
+                chosen = out[0, prompt.shape[1]:]
+                gap = (pred.max(-1).values - pred.gather(-1, chosen[:, None])[:, 0]).max().item()
+                tokens_per_step = len(chosen) / (len(stats["accepted"]) + 1)
+                log(f"  greedy generate ({name}, diffusion={use_diffusion}): {len(chosen)} "
+                    f"tokens, {tokens_per_step:.2f} tok/step, max argmax gap {gap:.3f}")
+                if gap > 0.5:
+                    failures.append(f"{name}: generated token {gap:.3f} logits below argmax")
+        del init_model
+        out = model.generate(prompt, max_new_tokens=64, temperature=0.8)
+        assert out.shape[1] > prompt.shape[1] and (out[0] < model.config.vocab_size).all()
+        log(f"  sampled generate (T=0.8): {out.shape[1] - prompt.shape[1]} tokens")
+
+        diff_logits, block_tokens = model(input_ids=prompt, diffusion_train=False,
+                                          is_diffusion_pass=True, return_block_tokens=True)
+        assert diff_logits.shape[:2] == (1, block_size), diff_logits.shape
+        assert torch.isfinite(diff_logits).all()
+        num_seeds = model.config.mtp_seed_tokens
+        assert int(block_tokens[0, 0]) == int(prompt[0, -1])
+        assert (block_tokens[0, 1 + num_seeds :] == model.config.mask_token_id).all()
+        if num_seeds:
+            assert (block_tokens[0, 1 : 1 + num_seeds] != model.config.mask_token_id).all()
+        log(f"  diffusion block {tuple(diff_logits.shape)}: anchor + {num_seeds} MTP drafts "
+            f"+ masks")
+    if failures:
+        raise AssertionError("; ".join(failures))
 
 
 def run_in_subprocess(fn, *fn_args) -> None:
@@ -350,7 +410,8 @@ def main():
     log("4/5 checkpoint contents")
     check_checkpoint(args)
     log("5/5 inference from the final checkpoint")
-    run_in_subprocess(check_inference, str(args.out_dir / "final"))
+    run_in_subprocess(check_inference, str(args.out_dir / "final"), str(args.cache_dir),
+                      str(args.init_dir))
 
     if not args.keep:
         shutil.rmtree(args.out_dir, ignore_errors=True)
