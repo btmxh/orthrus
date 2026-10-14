@@ -11,6 +11,8 @@ Builds what it needs if missing (truncated init checkpoint, small packed cache),
      anchor+-1 must NOT match, so RoPE/mask/conv/state off-by-ones are caught. Then the
      train and generation paths must agree on full blocks. With MTP seeding, the batched
      multi-anchor draft chain must equal sequential MTP decoding of each anchor (fp32).
+     Loss implementations agree (KL fused/chunked/naive, CE fused/torch) and the KL
+     teacher is position-aligned (slot 0's KL is ~0 at init).
   2. Training: loss finite and decreasing.
   3. Resume: a planted partial step-* dir is skipped by --auto-resume and pruned.
   4. Checkpoint: step-* dirs hold only the twins (equal to final's at the same step); final
@@ -138,6 +140,7 @@ def check_equivalence(init_dir: str) -> None:
             expect_match(f"train vs gen path, full block at anchor {anchor}",
                          min_cos(train_hidden[row, slot], gen_hidden[0]))
 
+        check_losses(model, input_ids, gen, failures)
         if model.mtp is not None:
             check_mtp_chain(model, gen, failures)
     if failures:
@@ -190,6 +193,85 @@ def check_mtp_chain(model, gen, failures) -> None:
                             f"{batched[0, slot].tolist()} vs {drafts}, rel err {rel_err:.2e}")
     log(f"  MTP chain ({len(anchors[0])} anchors x {num_seeds} drafts) vs sequential decoding: "
         f"max rel err = {worst:.2e}")
+
+
+def check_losses(model, input_ids, gen, failures) -> None:
+    """KL/CE loss implementations agree (fused vs chunked vs naive), and the KL teacher is
+    aligned: at init, block slot 0 equals the AR view at the anchor, so its KL is ~0."""
+    import torch
+    import torch.nn.functional as F
+
+    from src.train.loss import IGNORE_INDEX, build_loss_fn, kl_chunked
+
+    rows, hidden_size, vocab = 700, 128, 5000
+    weight = (torch.randn(vocab, hidden_size, device="cuda", generator=gen) * 0.05).bfloat16()
+    teacher = torch.randn(rows, hidden_size, device="cuda", generator=gen).bfloat16()
+    student = (teacher.float() + 0.5 * torch.randn(rows, hidden_size, device="cuda",
+                                                   generator=gen)).bfloat16()
+    labels = torch.randint(0, vocab, (rows,), device="cuda", generator=gen)
+    labels[torch.rand(rows, device="cuda", generator=gen) < 0.3] = IGNORE_INDEX
+    keep = labels != IGNORE_INDEX
+
+    def naive_kl(s):
+        s_logp = F.log_softmax(s[keep].float() @ weight.float().T, -1)
+        t_logp = F.log_softmax(teacher[keep].float() @ weight.float().T, -1)
+        return (t_logp.exp() * (t_logp - s_logp)).sum(-1).mean()
+
+    variants = {
+        "naive": naive_kl,
+        "chunked": lambda s: kl_chunked(s[keep], teacher[keep], weight, chunk_size=128),
+        "fused": lambda s: build_loss_fn("kl", use_liger=True)(weight, s, labels, teacher),
+        "ce fused": lambda s: build_loss_fn("ce", use_liger=True)(weight, s, labels),
+        "ce torch": lambda s: F.cross_entropy(s.float() @ weight.float().T, labels,
+                                              ignore_index=IGNORE_INDEX),
+    }
+    out = {}
+    with torch.enable_grad():
+        for name, fn in variants.items():
+            s = student.clone().requires_grad_()
+            loss = fn(s)
+            loss.backward()
+            out[name] = (loss.item(), s.grad.float())
+    for name, ref in (("chunked", "naive"), ("fused", "naive"), ("ce fused", "ce torch")):
+        loss_err = abs(out[name][0] - out[ref][0]) / abs(out[ref][0])
+        grad_err = ((out[name][1] - out[ref][1]).norm() / out[ref][1].norm()).item()
+        log(f"  loss {name} vs {ref}: loss rel err {loss_err:.1e}, grad rel err {grad_err:.1e}")
+        if loss_err > 1e-3 or grad_err > 2e-2:
+            failures.append(f"loss {name} disagrees with {ref}")
+
+    if getattr(model.config, "fixed_state_layers", None) or getattr(model.config, "mtp_seed_tokens", 0):
+        return                                  # slot 0 != AR at init in these variants
+    inner = model.model
+    inner.block_size = block_size = model.config.block_size
+    anchors = torch.stack([
+        torch.sort(torch.randperm(input_ids.shape[1] - block_size - 1, device="cuda",
+                                  generator=gen)[:16] + 1).values
+        for _ in range(input_ids.shape[0])
+    ])
+    seen = {}
+    kl_fn = build_loss_fn("kl", use_liger=True)
+
+    def recording(weight, hidden, labels, teacher_hidden):
+        seen.update(hidden=hidden, teacher=teacher_hidden)
+        return kl_fn(weight, hidden, labels, teacher_hidden)
+
+    recording.needs_teacher = True
+    model.loss_fn = recording
+    model(input_ids=input_ids, anchors=anchors)
+    model.loss_fn = None
+    lm_head = model.lm_head.weight.float()
+
+    def slot_kl(student_hidden, teacher_hidden):
+        s_logp = F.log_softmax(student_hidden.float().reshape(-1, lm_head.shape[1]) @ lm_head.T, -1)
+        t_logp = F.log_softmax(teacher_hidden.float().reshape(-1, lm_head.shape[1]) @ lm_head.T, -1)
+        return (t_logp.exp() * (t_logp - s_logp)).sum(-1).mean().item()
+
+    slot0 = slot_kl(seen["hidden"][:, :, 0], seen["teacher"][:, :, 0])
+    shifted = slot_kl(seen["hidden"][:, :, 0], seen["teacher"][:, :, 1])
+    log(f"  KL teacher alignment at init: slot 0 = {slot0:.4f} (must be ~0), "
+        f"vs teacher at a+1 = {shifted:.4f}")
+    if slot0 > 0.05 or shifted < 0.5:
+        failures.append(f"KL teacher misaligned (slot 0 {slot0:.4f}, shifted {shifted:.4f})")
 
 
 def train_losses(log_text: str) -> list[float]:

@@ -718,10 +718,13 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
         positions = anchors.reshape(batch_size, num_anchors, 1) + offsets.reshape(1, 1, -1)
         return self._rope(hidden_states, positions.reshape(batch_size, -1))
 
-    def diffusion_train_forward(self, input_ids, anchors, attention_mask=None, seed_fn=None):
+    def diffusion_train_forward(self, input_ids, anchors, attention_mask=None, seed_fn=None,
+                                return_ar_hidden=False):
         """One frozen AR pass + one batched diffusion pass over the ASCENDING anchor grid.
         `seed_fn(ar_hidden, input_ids, anchors) -> (B, A, k) | None` pre-drafts block slots
-        1..k (MTP); ar_hidden is the AR pass's last-layer output before the final norm."""
+        1..k (MTP); ar_hidden is the AR pass's last-layer output before the final norm.
+        With return_ar_hidden, also returns the AR view's final (post-norm) hidden states
+        (B, S, H): the teacher for the KL loss."""
         block_size = self.block_size
         device = input_ids.device
         batch_size, seq_len = input_ids.shape
@@ -781,6 +784,10 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
                 block_pos_emb=block_pos_emb,
                 flex_block_mask=flex_block_mask,
             )
+        if return_ar_hidden:
+            with torch.no_grad():
+                ar_final = self.norm(ar_hidden)
+            return self.norm(hidden), ar_final
         return self.norm(hidden)
 
     @staticmethod
@@ -954,15 +961,27 @@ class OrthrusQwen3_5ForCausalLM(OrthrusQwen3_5PreTrainedModel):
 
         from src.train.loss import block_local_labels  # local import: avoids a cycle
 
-        hidden = self.model.diffusion_train_forward(
-            input_ids, anchors, attention_mask=attention_mask, seed_fn=self._mtp_seeds
+        needs_teacher = getattr(self.loss_fn, "needs_teacher", False)
+        out = self.model.diffusion_train_forward(
+            input_ids, anchors, attention_mask=attention_mask, seed_fn=self._mtp_seeds,
+            return_ar_hidden=needs_teacher,
         )
+        hidden, teacher_hidden = out if needs_teacher else (out, None)
+        block_size = self.model.block_size
         labels = block_local_labels(
-            input_ids, anchors, self.model.block_size,
+            input_ids, anchors, block_size,
             supervise_mask=supervise_mask, anchor_valid=anchor_valid,
         )
+        if needs_teacher:
+            # Slot k (position a+k) predicts x_{a+k+1}; the AR view's prediction there is
+            # its state at a+k. Same (B, A, K, H) layout as the diffusion hidden.
+            positions = anchors.unsqueeze(-1) + torch.arange(block_size, device=anchors.device)
+            teacher_hidden = torch.gather(
+                teacher_hidden, 1,
+                positions.reshape(positions.shape[0], -1, 1).expand(-1, -1, teacher_hidden.shape[-1]),
+            ).reshape(hidden.shape)
         if self.loss_fn is not None:
-            loss = self.loss_fn(self.lm_head.weight, hidden, labels)
+            loss = self.loss_fn(self.lm_head.weight, hidden, labels, teacher_hidden)
         else:
             logits = self.lm_head(hidden).float()
             loss = F.cross_entropy(
