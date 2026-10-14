@@ -45,6 +45,7 @@ def init_orthrus(
     mask_token_id: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
     force: bool = False,
+    num_hidden_layers: int | None = None,
 ):
     """Base Qwen3.5 checkpoint -> Orthrus init checkpoint.
     """
@@ -58,6 +59,10 @@ def init_orthrus(
     text_cfg = getattr(base_cfg, "text_config", base_cfg)  # multimodal -> text tower
     cfg = OrthrusQwen3_5Config.from_dict(text_cfg.to_dict())
     cfg.block_size = block_size
+    if num_hidden_layers is not None:
+        # Keep only the first N decoder layers (smoke tests); later layers' weights are dropped.
+        cfg.num_hidden_layers = num_hidden_layers
+        cfg.layer_types = cfg.layer_types[:num_hidden_layers]
     cfg.use_cache = False
 
     if mask_token_id is None:
@@ -213,6 +218,8 @@ def parse_args():
     parser.add_argument("--dtype", type=str, default="bfloat16",
                         choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--num-hidden-layers", type=int, default=None,
+                        help="Truncate to the first N decoder layers (smoke tests only).")
     return parser.parse_args()
 
 
@@ -226,4 +233,5 @@ if __name__ == "__main__":
             "bfloat16": torch.bfloat16
         }[args.dtype],
         force=args.force,
+        num_hidden_layers=args.num_hidden_layers,
     )
