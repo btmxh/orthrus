@@ -41,6 +41,52 @@ def load_domain(source: str, domain: str):
     )
 
 
+def stream_prompts(source: str, domain: str, count: int, seed: int,
+                   buffer_size: int = 2000) -> list[list[dict]]:
+    """`count` usable prompts from a streamed, buffer-shuffled split: reads only the first
+    row groups instead of downloading the split (for quick benchmarks)."""
+    if os.path.isdir(source):
+        files = sorted(glob.glob(os.path.join(source, "data", f"{domain}-*.parquet")))
+        stream = datasets.load_dataset("parquet", data_files=files, split="train", streaming=True)
+    else:
+        stream = datasets.load_dataset(source, data_files={domain: f"data/{domain}-*.parquet"},
+                                       split=domain, streaming=True)
+    prompts = []
+    for row in stream.shuffle(seed=seed, buffer_size=buffer_size):
+        prompt = single_turn_prompt(row["messages"])
+        if prompt:
+            prompts.append(prompt)
+            if len(prompts) == count:
+                break
+    return prompts
+
+
+def make_request(domain: str, index: int, prompt: list[dict], model: str,
+                 max_tokens: int = 4096, temperature: float = 0.0, top_p: float = 1.0,
+                 top_k: int = -1, enable_thinking: bool = False) -> dict:
+    """An OpenAI-style chat request (vLLM batch format); generate_vllm.py reads the body.
+    Defaults: greedy, matching the greedy decoding the drafter is evaluated on, no thinking."""
+    body = {
+        "model": model, "messages": prompt, "max_completion_tokens": max_tokens,
+        "temperature": temperature, "top_p": top_p, "top_k": top_k,
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+    }
+    return {"custom_id": f"{domain}-{index:07d}", "method": "POST",
+            "url": "/v1/chat/completions", "body": body}
+
+
+def write_shards(requests: list[dict], out: str, num_shards: int, seed: int) -> None:
+    """Shuffle across domains so every shard (GPU) gets the same mix and length profile."""
+    random.Random(seed).shuffle(requests)
+    os.makedirs(out, exist_ok=True)
+    for shard in range(num_shards):
+        path = os.path.join(out, f"requests-{shard:05d}-of-{num_shards:05d}.jsonl")
+        with open(path, "w") as f:
+            for request in requests[shard :: num_shards]:
+                f.write(json.dumps(request, ensure_ascii=False) + "\n")
+    print(f"wrote {len(requests):,} requests to {num_shards} shards in {out}")
+
+
 def single_turn_prompt(messages) -> list[dict] | None:
     """Leading system messages (minus reasoning toggles) + the first user turn."""
     prompt = []
@@ -105,30 +151,12 @@ def main():
         per_domain = min(per_domain, args.per_domain)
     print(f"taking {per_domain:,} prompts per domain")
 
-    requests = []
-    for domain, found in prompts.items():
-        for index, prompt in enumerate(found[:per_domain]):
-            body = {
-                "model": args.model,
-                "messages": prompt,
-                "max_completion_tokens": args.max_tokens,
-                "temperature": args.temperature,
-                "top_p": args.top_p,
-                "top_k": args.top_k,
-                "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
-            }
-            requests.append({"custom_id": f"{domain}-{index:07d}", "method": "POST",
-                             "url": "/v1/chat/completions", "body": body})
-
-    # Shuffle across domains so every shard (GPU) gets the same mix and length profile.
-    random.Random(args.seed).shuffle(requests)
-    os.makedirs(args.out, exist_ok=True)
-    for shard in range(args.num_shards):
-        path = os.path.join(args.out, f"requests-{shard:05d}-of-{args.num_shards:05d}.jsonl")
-        with open(path, "w") as f:
-            for request in requests[shard :: args.num_shards]:
-                f.write(json.dumps(request, ensure_ascii=False) + "\n")
-    print(f"wrote {len(requests):,} requests to {args.num_shards} shards in {args.out}")
+    requests = [
+        make_request(domain, index, prompt, args.model, args.max_tokens, args.temperature,
+                     args.top_p, args.top_k, args.enable_thinking)
+        for domain, found in prompts.items() for index, prompt in enumerate(found[:per_domain])
+    ]
+    write_shards(requests, args.out, args.num_shards, args.seed)
 
 
 if __name__ == "__main__":

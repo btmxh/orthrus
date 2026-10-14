@@ -3,7 +3,13 @@ through vLLM's offline engine (no HTTP server). Runs in the isolated vLLM env:
 
     uv sync --project scripts/data/vllm-env                      # once, on the GPU node
     scripts/data/vllm-env/.venv/bin/python scripts/data/generate_vllm.py \
-        --model Qwen/Qwen3.5-4B --dir data/nemotron [--limit 4096]  # --limit: benchmark
+        --model Qwen/Qwen3.5-4B --dir data/nemotron
+
+Quick benchmark instead (no sampling step, no effect on the real run): streams --bench
+prompts per domain into a fresh data/bench/<timestamp>/ and generates them there.
+
+    scripts/data/vllm-env/.venv/bin/python scripts/data/generate_vllm.py \
+        --model Qwen/Qwen3.5-4B --bench 1024 [--chunk-size 512]
 
 Starts one worker per GPU, each owning one requests-*.jsonl shard (sample_nemotron.py
 writes one per GPU). A worker loads the model once and feeds LLM.chat chunks of
@@ -299,11 +305,32 @@ def summarize(metrics_dir: str, wall_s: float) -> dict:
     }
 
 
+def gpu_count(args) -> int:
+    return args.gpus or len(os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3").split(","))
+
+
+def bench(args) -> None:
+    """Stream --bench prompts per domain into a fresh run dir (one shard per GPU), then
+    generate them like a real run: same request format, workers and metrics."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from sample_nemotron import make_request, stream_prompts, write_shards
+
+    run_dir = os.path.join(args.dir or "data/bench", time.strftime("%Y%m%d-%H%M%S"))
+    requests = []
+    for domain in args.domains.split(","):
+        prompts = stream_prompts(args.source, domain, args.bench, args.seed)
+        print(f"{domain}: streamed {len(prompts):,} prompts", flush=True)
+        requests += [make_request(domain, i, p, args.model) for i, p in enumerate(prompts)]
+    write_shards(requests, run_dir, gpu_count(args), args.seed)
+    args.dir = run_dir
+    launch(args)
+
+
 def launch(args) -> None:
     shards = sorted(glob.glob(os.path.join(args.dir, "requests-*.jsonl")))
     if not shards:
         raise FileNotFoundError(f"no requests-*.jsonl in {args.dir}")
-    gpus = args.gpus or len(os.environ.get("CUDA_VISIBLE_DEVICES", "0,1,2,3").split(","))
+    gpus = gpu_count(args)
     if len(shards) > gpus:
         print(f"WARNING: {len(shards)} shards on {gpus} GPUs; extra shards run in later waves")
     worker_args = ["--model", args.model, "--chunk-size", str(args.chunk_size),
@@ -334,21 +361,32 @@ def launch(args) -> None:
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--model", required=True)
-    p.add_argument("--dir", help="Holds requests-*.jsonl; starts one worker per GPU.")
+    p.add_argument("--dir", help="Holds requests-*.jsonl; starts one worker per GPU. "
+                                 "With --bench: parent of the run dir (default data/bench).")
     p.add_argument("--shard", help="Worker mode: generate one requests-*.jsonl shard.")
     p.add_argument("--gpus", type=int, default=None,
                    help="Default: count of CUDA_VISIBLE_DEVICES, else 4.")
     p.add_argument("--chunk-size", type=int, default=8192,
                    help="Requests per LLM.chat call; also the resume granularity.")
+    p.add_argument("--bench", type=int, default=0,
+                   help="Quick benchmark: stream this many prompts per domain into a fresh "
+                        "run dir and generate them (sample_nemotron.py not needed).")
+    p.add_argument("--source", default="nvidia/Nemotron-Post-Training-Dataset-v2")
+    p.add_argument("--domains", default="chat,math,code")
     p.add_argument("--limit", type=int, default=0,
-                   help="Only the first N pending requests per shard (benchmarking).")
+                   help="Only the first N pending requests per shard.")
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
-    if (args.dir is None) == (args.shard is None):
-        p.error("pass exactly one of --dir (launch) / --shard (worker)")
-    run_worker(args) if args.shard else launch(args)
+    if args.bench:
+        if args.shard:
+            p.error("--bench starts its own workers; drop --shard")
+        bench(args)
+    elif (args.dir is None) == (args.shard is None):
+        p.error("pass exactly one of --dir (launch) / --shard (worker), or --bench N")
+    else:
+        run_worker(args) if args.shard else launch(args)
 
 
 if __name__ == "__main__":
