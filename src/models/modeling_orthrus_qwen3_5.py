@@ -28,6 +28,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from fla.modules.conv import causal_conv1d as fla_causal_conv1d
 
 from src.models.config_orthrus_qwen3_5 import OrthrusQwen3_5Config
+from src.models.mtp_qwen3_5 import Qwen3_5MTP
 
 _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
 _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=False)
@@ -622,8 +623,10 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
         positions = anchors.reshape(batch_size, num_anchors, 1) + offsets.reshape(1, 1, -1)
         return self._rope(hidden_states, positions.reshape(batch_size, -1))
 
-    def diffusion_train_forward(self, input_ids, anchors, attention_mask=None):
-        """One frozen AR pass + one batched diffusion pass over the ASCENDING anchor grid."""
+    def diffusion_train_forward(self, input_ids, anchors, attention_mask=None, seed_fn=None):
+        """One frozen AR pass + one batched diffusion pass over the ASCENDING anchor grid.
+        `seed_fn(ar_hidden, input_ids, anchors) -> (B, A, k) | None` pre-drafts block slots
+        1..k (MTP); ar_hidden is the AR pass's last-layer output before the final norm."""
         block_size = self.block_size
         device = input_ids.device
         batch_size, seq_len = input_ids.shape
@@ -663,6 +666,7 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
             dtype=torch.long, device=device,
         )
         block_tokens[:, :, 0] = torch.gather(input_ids, 1, anchors)
+        self._seed_blocks(block_tokens, seed_fn, ar_hidden, input_ids, anchors)
         block_hidden = self.embed_tokens(block_tokens)
 
         flat_blocks = block_hidden.reshape(batch_size, num_anchors * block_size, -1)
@@ -684,8 +688,17 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
             )
         return self.norm(hidden)
 
+    @staticmethod
+    def _seed_blocks(block_tokens, seed_fn, ar_hidden, input_ids, anchors):
+        if seed_fn is None:
+            return
+        seeds = seed_fn(ar_hidden, input_ids, anchors)
+        if seeds is not None:
+            block_tokens[:, :, 1 : 1 + seeds.shape[-1]] = seeds
+
     @torch.no_grad()
-    def diffusion_block_forward(self, prefix_ids, diff_len=None, attention_mask=None):
+    def diffusion_block_forward(self, prefix_ids, diff_len=None, attention_mask=None,
+                                seed_fn=None, return_block_tokens=False):
         block_size = diff_len or self.block_size
         device = prefix_ids.device
         batch_size, prefix_len = prefix_ids.shape
@@ -724,6 +737,7 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
             (1, 1, block_size), self.mask_token_id, dtype=torch.long, device=device
         )
         block_tokens[:, :, 0] = prefix_ids[:, anchor]
+        self._seed_blocks(block_tokens, seed_fn, ar_hidden, prefix_ids, anchors)
         block_hidden = self.embed_tokens(block_tokens)
         block_pos_emb = self._block_rope(
             block_hidden.reshape(1, block_size, -1), anchors, block_size
@@ -739,7 +753,8 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
                 block_pos_emb=block_pos_emb,
                 ar_seq_len=anchor,
             )
-        return self.norm(hidden).reshape(1, block_size, -1)
+        hidden = self.norm(hidden).reshape(1, block_size, -1)
+        return (hidden, block_tokens.reshape(1, block_size)) if return_block_tokens else hidden
 
 
 class OrthrusQwen3_5ForCausalLM(OrthrusQwen3_5PreTrainedModel):
@@ -750,9 +765,20 @@ class OrthrusQwen3_5ForCausalLM(OrthrusQwen3_5PreTrainedModel):
         self.model = OrthrusQwen3_5Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Frozen MTP head (checkpoint keys `mtp.*`) that pre-drafts block slots 1..k.
+        self.mtp = Qwen3_5MTP(config) if config.mtp_seed_tokens > 0 else None
 
         self.loss_fn = None
         self.post_init()
+
+    def _mtp_seeds(self, ar_hidden, input_ids, anchors):
+        num_seeds = min(self.config.mtp_seed_tokens, self.model.block_size - 1)
+        if self.mtp is None or num_seeds <= 0:
+            return None
+        return self.mtp.seed_tokens(
+            self.model.norm(ar_hidden), input_ids, anchors, num_seeds,
+            self.model.embed_tokens, self.lm_head, self.model._rope,
+        )
 
     def forward(
         self,
@@ -766,13 +792,18 @@ class OrthrusQwen3_5ForCausalLM(OrthrusQwen3_5PreTrainedModel):
         position_ids=None,
         logits_to_keep: int = 0,
         diff_len: int | None = None,
+        return_block_tokens: bool = False,
         **kwargs,
     ):
         if not diffusion_train:
             if is_diffusion_pass:
-                hidden = self.model.diffusion_block_forward(
-                    input_ids, diff_len=diff_len, attention_mask=attention_mask
+                hidden, block_tokens = self.model.diffusion_block_forward(
+                    input_ids, diff_len=diff_len, attention_mask=attention_mask,
+                    seed_fn=self._mtp_seeds, return_block_tokens=True,
                 )
+                logits = self.lm_head(hidden).float()
+                # block_tokens: [anchor, MTP drafts..., MASK...] as fed to the diffusion view.
+                return (logits, block_tokens) if return_block_tokens else logits
             else:
                 hidden = self.model(
                     input_ids=input_ids, position_ids=position_ids,
@@ -785,7 +816,7 @@ class OrthrusQwen3_5ForCausalLM(OrthrusQwen3_5PreTrainedModel):
         from src.train.loss import block_local_labels  # local import: avoids a cycle
 
         hidden = self.model.diffusion_train_forward(
-            input_ids, anchors, attention_mask=attention_mask
+            input_ids, anchors, attention_mask=attention_mask, seed_fn=self._mtp_seeds
         )
         labels = block_local_labels(
             input_ids, anchors, self.model.block_size,

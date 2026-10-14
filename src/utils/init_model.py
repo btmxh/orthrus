@@ -46,6 +46,7 @@ def init_orthrus(
     dtype: torch.dtype = torch.bfloat16,
     force: bool = False,
     num_hidden_layers: int | None = None,
+    mtp_seed_tokens: int = 0,
 ):
     """Base Qwen3.5 checkpoint -> Orthrus init checkpoint.
     """
@@ -59,6 +60,7 @@ def init_orthrus(
     text_cfg = getattr(base_cfg, "text_config", base_cfg)  # multimodal -> text tower
     cfg = OrthrusQwen3_5Config.from_dict(text_cfg.to_dict())
     cfg.block_size = block_size
+    cfg.mtp_seed_tokens = mtp_seed_tokens
     if num_hidden_layers is not None:
         # Keep only the first N decoder layers (smoke tests); later layers' weights are dropped.
         cfg.num_hidden_layers = num_hidden_layers
@@ -85,8 +87,11 @@ def init_orthrus(
             remapped[key.replace("model.language_model.", "model.", 1)] = value
         elif key.startswith("language_model."):
             remapped["model." + key[len("language_model.") :]] = value
-        elif key.startswith(("model.visual.", "visual.", "mtp", "model.mtp")):
-            continue  # vision tower / multi-token-prediction head: not the text decoder
+        elif key.startswith(("model.visual.", "visual.")):
+            continue  # vision tower: not the text decoder
+        elif key.startswith(("mtp.", "model.mtp.")):
+            if mtp_seed_tokens > 0:   # kept as the frozen MTP pre-drafter
+                remapped[key[key.index("mtp."):]] = value
         else:
             remapped[key] = value
 
@@ -220,6 +225,8 @@ def parse_args():
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--num-hidden-layers", type=int, default=None,
                         help="Truncate to the first N decoder layers (smoke tests only).")
+    parser.add_argument("--mtp-seed-tokens", type=int, default=0,
+                        help="Keep the MTP head and pre-draft this many block slots with it.")
     return parser.parse_args()
 
 
@@ -234,4 +241,5 @@ if __name__ == "__main__":
         }[args.dtype],
         force=args.force,
         num_hidden_layers=args.num_hidden_layers,
+        mtp_seed_tokens=args.mtp_seed_tokens,
     )

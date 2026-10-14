@@ -13,8 +13,11 @@ class OrthrusQwen3_5Config(Qwen3_5TextConfig):
         *args,
         block_size: Optional[int] = None,
         mask_token_id: Optional[int] = None,
+        mtp_seed_tokens: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.block_size = block_size
         self.mask_token_id = mask_token_id
+        # Block slots 1..k pre-drafted by the frozen MTP head (0 = off, no MTP weights).
+        self.mtp_seed_tokens = mtp_seed_tokens

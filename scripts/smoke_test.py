@@ -2,13 +2,15 @@
 
     python scripts/smoke_test.py               # one GPU (fits a 6GB card)
     python scripts/smoke_test.py --nproc 8     # torchrun + FSDP2, e.g. on the H100 node
+    python scripts/smoke_test.py --mtp-seed-tokens 3   # MTP pre-drafted blocks
 
 Builds what it needs if missing (truncated init checkpoint, small packed cache), then checks:
   1. Init checks. Equivalence: at init the twins equal the AR weights, so with block_size=1
      the diffusion view must reproduce the AR hidden state at every anchor -- on the training
      path (flex mask, chained delta-net states) and the generation path. A control at
      anchor+-1 must NOT match, so RoPE/mask/conv/state off-by-ones are caught. Then the
-     train and generation paths must agree on full blocks.
+     train and generation paths must agree on full blocks. With MTP seeding, the batched
+     multi-anchor draft chain must equal sequential MTP decoding of each anchor (fp32).
   2. Training: loss finite and decreasing.
   3. Resume: a planted partial step-* dir is skipped by --auto-resume and pruned.
   4. Checkpoint: step-* dirs hold only the twins (equal to final's at the same step); final
@@ -57,7 +59,8 @@ def ensure_prereqs(args) -> None:
         log(f"building {args.num_layers}-layer init checkpoint at {args.init_dir}")
         run([sys.executable, "-m", "src.utils.init_model", "--base", args.base,
              "--out", str(args.init_dir), "--block-size", "16",
-             "--num-hidden-layers", str(args.num_layers)],
+             "--num-hidden-layers", str(args.num_layers),
+             "--mtp-seed-tokens", str(args.mtp_seed_tokens)],
             args.out_dir.parent / "smoke-init.log")
     if not args.cache_dir.exists():
         from huggingface_hub import hf_hub_download
@@ -132,8 +135,59 @@ def check_equivalence(init_dir: str) -> None:
             gen_hidden = inner.diffusion_block_forward(input_ids[row : row + 1, : anchor + 1])
             expect_match(f"train vs gen path, full block at anchor {anchor}",
                          min_cos(train_hidden[row, slot], gen_hidden[0]))
+
+        if model.mtp is not None:
+            check_mtp_chain(model, gen, failures)
     if failures:
         raise AssertionError("; ".join(failures))
+
+
+def check_mtp_chain(model, gen, failures) -> None:
+    """Batched seed_tokens (many anchors, masked chain) vs plain causal MTP decoding of one
+    anchor at a time, compared on each step's hidden state (fp32, random inputs). Tokens
+    alone are too coarse: an extra visible key rarely flips the argmax."""
+    import torch
+
+    model.float()
+    inner, mtp = model.model, model.mtp
+    num_seeds = min(model.config.mtp_seed_tokens, inner.block_size - 1)
+    seq_len = 256
+    input_ids = torch.randint(0, 150000, (1, seq_len), device="cuda", generator=gen)
+    ar_hidden = torch.randn(1, seq_len, inner.config.hidden_size, device="cuda", generator=gen)
+    anchors = torch.tensor([[1, 2, 9, 120, 121, 250]], device="cuda")
+
+    step_hidden = []                               # what seed_tokens feeds the lm_head
+
+    def recording_lm_head(hidden):
+        step_hidden.append(hidden)
+        return model.lm_head(hidden)
+
+    batched = mtp.seed_tokens(ar_hidden, input_ids, anchors, num_seeds,
+                              inner.embed_tokens, recording_lm_head, inner._rope)
+    batched_hidden = torch.stack(step_hidden, dim=2)[0]           # (A, steps, H)
+
+    worst = 0.0
+    for slot, anchor in enumerate(anchors[0].tolist()):
+        # Step-1 inputs (h_p, x_{p+1}) for p < anchor, then each draft appended in turn.
+        embeds = inner.embed_tokens(input_ids[:, 1 : anchor + 1])
+        hidden = ar_hidden[:, :anchor]
+        drafts, outs = [], []
+        for _ in range(num_seeds):
+            positions = torch.arange(embeds.shape[1], device="cuda").unsqueeze(0)
+            out, _ = mtp.step(embeds, hidden, inner._rope(embeds, positions))
+            draft = model.lm_head(out[:, -1:]).argmax(-1)
+            drafts.append(int(draft))
+            outs.append(out[0, -1])
+            embeds = torch.cat([embeds, inner.embed_tokens(draft)], dim=1)
+            hidden = torch.cat([hidden, out[:, -1:]], dim=1)
+        reference = torch.stack(outs)                               # (steps, H)
+        rel_err = ((batched_hidden[slot] - reference).norm(dim=-1) / reference.norm(dim=-1)).max()
+        worst = max(worst, rel_err.item())
+        if batched[0, slot].tolist() != drafts or rel_err > 1e-4:
+            failures.append(f"MTP chain mismatch at anchor {anchor}: tokens "
+                            f"{batched[0, slot].tolist()} vs {drafts}, rel err {rel_err:.2e}")
+    log(f"  MTP chain ({len(anchors[0])} anchors x {num_seeds} drafts) vs sequential decoding: "
+        f"max rel err = {worst:.2e}")
 
 
 def train_losses(log_text: str) -> list[float]:
@@ -238,12 +292,19 @@ def check_inference(final_dir: str) -> None:
     input_ids = torch.tensor([prompt], device="cuda")
     with torch.no_grad():
         ar_logits = model(input_ids=input_ids, diffusion_train=False)
-        diff_logits = model(input_ids=input_ids, diffusion_train=False, is_diffusion_pass=True)
+        diff_logits, block_tokens = model(input_ids=input_ids, diffusion_train=False,
+                                          is_diffusion_pass=True, return_block_tokens=True)
     block_size = model.config.block_size
     assert ar_logits.shape[:2] == (1, input_ids.shape[1])
     assert diff_logits.shape[:2] == (1, block_size), diff_logits.shape
     assert torch.isfinite(ar_logits).all() and torch.isfinite(diff_logits).all()
-    log(f"  AR logits {tuple(ar_logits.shape)}, diffusion block {tuple(diff_logits.shape)}")
+    num_seeds = model.config.mtp_seed_tokens
+    assert int(block_tokens[0, 0]) == prompt[-1]
+    assert (block_tokens[0, 1 + num_seeds :] == model.config.mask_token_id).all()
+    if num_seeds:
+        assert (block_tokens[0, 1 : 1 + num_seeds] != model.config.mask_token_id).all()
+    log(f"  AR logits {tuple(ar_logits.shape)}, diffusion block {tuple(diff_logits.shape)}, "
+        f"block = anchor + {num_seeds} MTP drafts + masks")
 
 
 def run_in_subprocess(fn, *fn_args) -> None:
@@ -265,10 +326,13 @@ def parse_args():
     p.add_argument("--nproc", type=int, default=1, help=">1 launches torchrun with --fsdp2.")
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--keep", action="store_true", help="Keep checkpoints/logs after success.")
+    p.add_argument("--mtp-seed-tokens", type=int, default=0,
+                   help="Passed to init_model: MTP-pre-drafted block slots.")
     args = p.parse_args()
     if args.init_dir is None:
         name = args.base.split("/")[-1].lower()
-        args.init_dir = Path(f"pretrained-models/orthrus-{name}-L{args.num_layers}-init")
+        variant = f"-mtp{args.mtp_seed_tokens}" if args.mtp_seed_tokens else ""
+        args.init_dir = Path(f"pretrained-models/orthrus-{name}-L{args.num_layers}{variant}-init")
     if args.steps < 2:
         p.error("--steps must be >= 2")
     return args
