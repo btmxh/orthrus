@@ -2,13 +2,15 @@
 
     python scripts/smoke_test.py               # one GPU (fits a 6GB card)
     python scripts/smoke_test.py --nproc 8     # torchrun + FSDP2, e.g. on the H100 node
+    python scripts/smoke_test.py --fixed-state-layers 0,1,2   # fixed-state GDN twins
 
 Builds what it needs if missing (truncated init checkpoint, small packed cache), then checks:
   1. Init checks. Equivalence: at init the twins equal the AR weights, so with block_size=1
      the diffusion view must reproduce the AR hidden state at every anchor -- on the training
      path (flex mask, chained delta-net states) and the generation path. A control at
-     anchor+-1 must NOT match, so RoPE/mask/conv/state off-by-ones are caught. Then the
-     train and generation paths must agree on full blocks.
+     anchor+-1 must NOT match, so RoPE/mask/conv/state off-by-ones are caught. Fixed-state
+     twins skip the anchor's own write, so instead their readout is checked against the
+     delta rule with beta=0. Always: train and generation paths agree on full blocks.
   2. Training: loss finite and decreasing.
   3. Resume: a planted partial step-* dir is skipped by --auto-resume and pruned.
   4. Checkpoint: step-* dirs hold only the twins (equal to final's at the same step); final
@@ -57,7 +59,9 @@ def ensure_prereqs(args) -> None:
         log(f"building {args.num_layers}-layer init checkpoint at {args.init_dir}")
         run([sys.executable, "-m", "src.utils.init_model", "--base", args.base,
              "--out", str(args.init_dir), "--block-size", "16",
-             "--num-hidden-layers", str(args.num_layers)],
+             "--num-hidden-layers", str(args.num_layers)]
+            + (["--fixed-state-layers", args.fixed_state_layers]
+               if args.fixed_state_layers else []),
             args.out_dir.parent / "smoke-init.log")
     if not args.cache_dir.exists():
         from huggingface_hub import hf_hub_download
@@ -75,7 +79,8 @@ def check_equivalence(init_dir: str) -> None:
     import torch
     import torch.nn.functional as F
 
-    from src.models.modeling_orthrus_qwen3_5 import OrthrusQwen3_5ForCausalLM
+    from src.models.modeling_orthrus_qwen3_5 import OrthrusQwen3_5ForCausalLM, causal_conv1d
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
 
     model = OrthrusQwen3_5ForCausalLM.from_pretrained(
         init_dir, dtype=torch.bfloat16, attn_implementation="flash_attention_2"
@@ -104,24 +109,62 @@ def check_equivalence(init_dir: str) -> None:
         ])
 
     with torch.no_grad():
-        # Twins == AR weights at init, so a 1-token block reproduces the AR state.
-        ar_hidden = inner(input_ids=input_ids).last_hidden_state
-        inner.block_size = 1
-        anchors = sorted_anchors(256, 510)   # >= 128 queries keeps flex off its decode kernel
-        diff_hidden = inner.diffusion_train_forward(input_ids, anchors)[:, :, 0]
-        expect_match("train path vs AR", min_cos(diff_hidden, at(ar_hidden, anchors)))
-        for shift in (-1, 1):
-            shifted = (anchors + shift).clamp(0, input_ids.shape[1] - 1)
-            cos = min_cos(diff_hidden, at(ar_hidden, shifted))
-            log(f"  control anchor{shift:+d}: min cos = {cos:.5f} (must be low)")
-            if cos > 0.9:
-                failures.append(f"control at anchor{shift:+d} matches; check has no teeth")
-        # Short prefixes exercise the zero-padded conv left-context.
-        for prefix_len in (1, 2, 3, 4, 37, 300):
-            gen_hidden = inner.diffusion_block_forward(input_ids[:1, :prefix_len], diff_len=1)
-            expect_match(f"gen path vs AR, prefix_len={prefix_len}",
-                         min_cos(gen_hidden[:, 0], ar_hidden[:1, prefix_len - 1]))
-        inner.block_size = block_size
+        if not model.config.fixed_state_layers:
+            # Twins == AR weights at init, so a 1-token block reproduces the AR state.
+            ar_hidden = inner(input_ids=input_ids).last_hidden_state
+            inner.block_size = 1
+            anchors = sorted_anchors(256, 510)   # >= 128 queries keeps flex off its decode kernel
+            diff_hidden = inner.diffusion_train_forward(input_ids, anchors)[:, :, 0]
+            expect_match("train path vs AR", min_cos(diff_hidden, at(ar_hidden, anchors)))
+            for shift in (-1, 1):
+                shifted = (anchors + shift).clamp(0, input_ids.shape[1] - 1)
+                cos = min_cos(diff_hidden, at(ar_hidden, shifted))
+                log(f"  control anchor{shift:+d}: min cos = {cos:.5f} (must be low)")
+                if cos > 0.9:
+                    failures.append(f"control at anchor{shift:+d} matches; check has no teeth")
+            # Short prefixes exercise the zero-padded conv left-context.
+            for prefix_len in (1, 2, 3, 4, 37, 300):
+                gen_hidden = inner.diffusion_block_forward(input_ids[:1, :prefix_len], diff_len=1)
+                expect_match(f"gen path vs AR, prefix_len={prefix_len}",
+                             min_cos(gen_hidden[:, 0], ar_hidden[:1, prefix_len - 1]))
+            inner.block_size = block_size
+        else:
+            log("  (AR equivalence skipped: fixed-state twins skip the anchor's own write)")
+            for layer in inner.layers:
+                net = getattr(layer, "linear_attn", None)
+                if net is None or not net.fixed_state:
+                    continue
+                # Readout must equal the gated delta rule with beta=0 (no writes).
+                num_blocks = 4
+                hidden = torch.randn(1, num_blocks, block_size, inner.config.hidden_size,
+                                     device="cuda", dtype=torch.bfloat16, generator=gen)
+                states = torch.randn(num_blocks, net.num_v_heads, net.head_k_dim,
+                                     net.head_v_dim, device="cuda", generator=gen)
+                lefts = torch.randn(num_blocks, net.conv_kernel_size - 1, net.conv_dim,
+                                    device="cuda", dtype=torch.bfloat16, generator=gen)
+                out = net.diffusion_blocks(hidden, (states, lefts))
+
+                flat = hidden.reshape(num_blocks, block_size, -1)
+                query = causal_conv1d(
+                    torch.cat([lefts[..., : net.key_dim], net.in_proj_q_diff(flat)], dim=1),
+                    net.conv1d_diff, net.activation,
+                )[:, -block_size:].reshape(num_blocks, block_size, -1, net.head_k_dim)
+                query = query.repeat_interleave(net.num_v_heads // net.num_k_heads, dim=2)
+                decay = -net.A_log_diff.float().exp() * F.softplus(
+                    net.in_proj_a_diff(flat).float() + net.dt_bias_diff
+                )
+                value = torch.randn(num_blocks, block_size, net.num_v_heads, net.head_v_dim,
+                                    device="cuda", dtype=torch.bfloat16, generator=gen)
+                core, _ = torch_chunk_gated_delta_rule(
+                    query, torch.randn_like(query), value, g=decay,
+                    beta=torch.zeros_like(decay), initial_state=states,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                core = net.norm_diff(core.reshape(-1, net.head_v_dim),
+                                     net.in_proj_z_diff(flat).reshape(-1, net.head_v_dim))
+                ref = net.out_proj_diff(core.reshape(1, num_blocks, block_size, -1))
+                expect_match(f"fixed-state layer {layer.layer_idx} vs delta rule (beta=0)",
+                             min_cos(out, ref))
 
         # The batched training path and the generation path must agree on full blocks.
         anchors = sorted_anchors(16, input_ids.shape[1] - block_size - 1)
@@ -265,10 +308,14 @@ def parse_args():
     p.add_argument("--nproc", type=int, default=1, help=">1 launches torchrun with --fsdp2.")
     p.add_argument("--steps", type=int, default=10)
     p.add_argument("--keep", action="store_true", help="Keep checkpoints/logs after success.")
+    p.add_argument("--fixed-state-layers", default=None,
+                   help="Passed to init_model: 'all' or comma-separated GDN layer indices.")
     args = p.parse_args()
     if args.init_dir is None:
         name = args.base.split("/")[-1].lower()
-        args.init_dir = Path(f"pretrained-models/orthrus-{name}-L{args.num_layers}-init")
+        variant = f"-fs{args.fixed_state_layers.replace(',', '_')}" \
+            if args.fixed_state_layers else ""
+        args.init_dir = Path(f"pretrained-models/orthrus-{name}-L{args.num_layers}{variant}-init")
     if args.steps < 2:
         p.error("--steps must be >= 2")
     return args
@@ -279,7 +326,7 @@ def main():
     args = parse_args()
     ensure_prereqs(args)
 
-    log("1/5 init checks (AR equivalence, train-gen parity)")
+    log("1/5 init checks (AR equivalence / fixed-state readout, train-gen parity)")
     run_in_subprocess(check_equivalence, str(args.init_dir))
     log("2-3/5 training + resume")
     check_training(args)

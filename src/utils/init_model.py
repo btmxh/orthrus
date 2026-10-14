@@ -38,6 +38,23 @@ def _load_base_state_dict(model_name_or_path: str) -> dict:
     return state_dict
 
 
+def _parse_fixed_state_layers(spec: str | None, layer_types: list[str]) -> list[int]:
+    """'all' -> every linear-attention layer; '0,1,2' -> those layer indices."""
+    linear = [i for i, kind in enumerate(layer_types) if kind == "linear_attention"]
+    if not spec:
+        return []
+    if spec == "all":
+        return linear
+    layers = sorted({int(index) for index in spec.split(",")})
+    not_linear = [i for i in layers if i not in linear]
+    if not_linear:
+        raise ValueError(
+            f"--fixed-state-layers {not_linear} are not linear-attention layers; "
+            f"those are {linear}."
+        )
+    return layers
+
+
 def init_orthrus(
     base_model_name_or_path: str,
     out_dir: str,
@@ -46,6 +63,7 @@ def init_orthrus(
     dtype: torch.dtype = torch.bfloat16,
     force: bool = False,
     num_hidden_layers: int | None = None,
+    fixed_state_layers: str | None = None,
 ):
     """Base Qwen3.5 checkpoint -> Orthrus init checkpoint.
     """
@@ -63,6 +81,7 @@ def init_orthrus(
         # Keep only the first N decoder layers (smoke tests); later layers' weights are dropped.
         cfg.num_hidden_layers = num_hidden_layers
         cfg.layer_types = cfg.layer_types[:num_hidden_layers]
+    cfg.fixed_state_layers = _parse_fixed_state_layers(fixed_state_layers, cfg.layer_types)
     cfg.use_cache = False
 
     if mask_token_id is None:
@@ -118,6 +137,7 @@ def init_orthrus(
           f"vocab_size={cfg.vocab_size}")
     print(f"[init] layer_types: {cfg.layer_types.count('linear_attention')} linear_attention + "
           f"{cfg.layer_types.count('full_attention')} full_attention")
+    print(f"[init] fixed_state_layers: {cfg.fixed_state_layers}")
     print(f"[init] params: total={total/1e9:.2f}B trainable(diff)={trainable/1e9:.2f}B "
           f"({100.0 * trainable / total:.1f}%)")
     print(f"[init] unexpected keys dropped: {len(unexpected_keys)}")
@@ -220,6 +240,9 @@ def parse_args():
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--num-hidden-layers", type=int, default=None,
                         help="Truncate to the first N decoder layers (smoke tests only).")
+    parser.add_argument("--fixed-state-layers", type=str, default=None,
+                        help="Linear-attention layers whose twin only reads the AR prefix "
+                             "state: 'all' or comma-separated layer indices.")
     return parser.parse_args()
 
 
@@ -234,4 +257,5 @@ if __name__ == "__main__":
         }[args.dtype],
         force=args.force,
         num_hidden_layers=args.num_hidden_layers,
+        fixed_state_layers=args.fixed_state_layers,
     )

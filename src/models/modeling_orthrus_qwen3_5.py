@@ -22,6 +22,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     apply_mask_to_padding_states,
     apply_rotary_pos_emb,
     eager_attention_forward,
+    l2norm,
     torch_chunk_gated_delta_rule,
 )
 
@@ -39,6 +40,8 @@ DIFF_PARAM_SUFFIXES = (
     # gated delta-net
     "in_proj_qkv_diff", "in_proj_z_diff", "in_proj_b_diff", "in_proj_a_diff",
     "conv1d_diff", "dt_bias_diff", "A_log_diff", "norm_diff", "out_proj_diff",
+    # fixed-state gated delta-net (query-only projection)
+    "in_proj_q_diff",
 )
 
 
@@ -260,7 +263,15 @@ class OrthrusQwen3_5Attention(nn.Module):
 
 
 class OrthrusQwen3_5GatedDeltaNet(nn.Module):
-    """Qwen3.5 Gated DeltaNet"""
+    """Qwen3.5 Gated DeltaNet.
+
+    With `fixed_state`, the diffusion twin treats block inputs as carrying no information
+    to write: it never updates the AR prefix state, only reads it. That is the gated delta
+    rule with beta=0, whose output at t is exp(sum_{j<=t} g_j) * S_prefix^T q_t, so the twin
+    drops the k/v projections and beta. The decay stays: although it is a per-head scale,
+    prefix readouts mostly sit near norm_diff's eps, so it acts as an amplitude gate that
+    fades decayed heads to ~0 rather than being normalized away.
+    """
 
     def __init__(self, config: OrthrusQwen3_5Config, layer_idx: int):
         super().__init__()
@@ -277,10 +288,12 @@ class OrthrusQwen3_5GatedDeltaNet(nn.Module):
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.activation = config.hidden_act
 
-        def _conv():
+        self.fixed_state = layer_idx in config.fixed_state_layers
+
+        def _conv(channels=self.conv_dim):
             return nn.Conv1d(
-                self.conv_dim, self.conv_dim, bias=False,
-                kernel_size=self.conv_kernel_size, groups=self.conv_dim,
+                channels, channels, bias=False,
+                kernel_size=self.conv_kernel_size, groups=channels,
                 padding=self.conv_kernel_size - 1,
             )
 
@@ -296,13 +309,18 @@ class OrthrusQwen3_5GatedDeltaNet(nn.Module):
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
         # Diffusion View Components
-        self.conv1d_diff = _conv()
         self.dt_bias_diff = nn.Parameter(torch.ones(self.num_v_heads))
         self.A_log_diff = nn.Parameter(torch.log(torch.empty(self.num_v_heads).uniform_(0, 16)))
-        self.in_proj_qkv_diff = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
         self.in_proj_z_diff = nn.Linear(self.hidden_size, self.value_dim, bias=False)
-        self.in_proj_b_diff = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.in_proj_a_diff = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
+        if self.fixed_state:
+            # Query channels only: nothing is written, so no k/v/beta.
+            self.conv1d_diff = _conv(self.key_dim)
+            self.in_proj_q_diff = nn.Linear(self.hidden_size, self.key_dim, bias=False)
+        else:
+            self.conv1d_diff = _conv()
+            self.in_proj_qkv_diff = nn.Linear(self.hidden_size, self.conv_dim, bias=False)
+            self.in_proj_b_diff = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)
         self.norm_diff = Qwen3_5RMSNormGated(self.head_v_dim, eps=config.rms_norm_eps)
         self.out_proj_diff = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
@@ -457,6 +475,8 @@ class OrthrusQwen3_5GatedDeltaNet(nn.Module):
         return states.reshape(-1, self.num_v_heads, self.head_k_dim, self.head_v_dim)
 
     def diffusion_blocks(self, block_hidden_states, seeds):
+        if self.fixed_state:
+            return self._fixed_state_blocks(block_hidden_states, seeds)
         recurrent_states, conv_lefts = seeds
         batch_size, num_anchors, block_size, _ = block_hidden_states.shape
         num_blocks = batch_size * num_anchors
@@ -488,6 +508,44 @@ class OrthrusQwen3_5GatedDeltaNet(nn.Module):
         return self.out_proj_diff(
             core.reshape(batch_size, num_anchors, block_size, -1)
         )
+
+
+    def _fixed_state_blocks(self, block_hidden_states, seeds):
+        recurrent_states, conv_lefts = seeds   # (blocks, v_heads, k_dim, v_dim) fp32
+        batch_size, num_anchors, block_size, _ = block_hidden_states.shape
+        num_blocks = batch_size * num_anchors
+        flat_blocks = block_hidden_states.reshape(num_blocks, block_size, -1)
+
+        # Query stream through the twin conv, left-seeded with the AR query channels.
+        query_mixed = self.in_proj_q_diff(flat_blocks)
+        seeded_stream = torch.cat(
+            [conv_lefts[..., : self.key_dim].to(query_mixed), query_mixed], dim=1
+        )
+        query_states = causal_conv1d(seeded_stream, self.conv1d_diff, self.activation)
+        query_states = query_states[:, -block_size:].reshape(
+            num_blocks, block_size, -1, self.head_k_dim
+        )
+        if self.num_v_heads > self.num_k_heads:
+            query_states = query_states.repeat_interleave(
+                self.num_v_heads // self.num_k_heads, dim=2
+            )
+        # Exactly the kernel's query normalization (fp32 l2norm, then 1/sqrt(dk)): the
+        # absolute scale matters, since readouts are often near norm_diff's eps.
+        query_states = l2norm(query_states.float(), dim=-1, eps=1e-6) * self.head_k_dim**-0.5
+
+        # No writes: the state at t is the prefix state decayed by the gates up to t.
+        gate_decay = -self.A_log_diff.float().exp() * F.softplus(
+            self.in_proj_a_diff(flat_blocks).float() + self.dt_bias_diff
+        )
+        cum_decay = gate_decay.cumsum(dim=1).exp()           # (blocks, block, v_heads)
+        core = torch.einsum("bthk,bhkv->bthv", query_states, recurrent_states)
+        core = (core * cum_decay.unsqueeze(-1)).to(block_hidden_states.dtype)
+
+        gate_input = self.in_proj_z_diff(flat_blocks)
+        core = self.norm_diff(
+            core.reshape(-1, self.head_v_dim), gate_input.reshape(-1, self.head_v_dim)
+        )
+        return self.out_proj_diff(core.reshape(batch_size, num_anchors, block_size, -1))
 
 
 class OrthrusQwen3_5DecoderLayer(nn.Module):
@@ -819,14 +877,22 @@ def copy_diff_from_ar(model: OrthrusQwen3_5ForCausalLM) -> None:
         if layer.layer_type == "linear_attention":
             delta_net = layer.linear_attn
             twin_pairs = (
-                (delta_net.in_proj_qkv_diff, delta_net.in_proj_qkv),
                 (delta_net.in_proj_z_diff, delta_net.in_proj_z),
-                (delta_net.in_proj_b_diff, delta_net.in_proj_b),
                 (delta_net.in_proj_a_diff, delta_net.in_proj_a),
                 (delta_net.out_proj_diff, delta_net.out_proj),
-                (delta_net.conv1d_diff, delta_net.conv1d),
                 (delta_net.norm_diff, delta_net.norm),
             )
+            if delta_net.fixed_state:
+                # Query channels lead the [q, k, v] split of the AR projection and conv.
+                key_dim = delta_net.key_dim
+                delta_net.in_proj_q_diff.weight.copy_(delta_net.in_proj_qkv.weight[:key_dim])
+                delta_net.conv1d_diff.weight.copy_(delta_net.conv1d.weight[:key_dim])
+            else:
+                twin_pairs += (
+                    (delta_net.in_proj_qkv_diff, delta_net.in_proj_qkv),
+                    (delta_net.in_proj_b_diff, delta_net.in_proj_b),
+                    (delta_net.conv1d_diff, delta_net.conv1d),
+                )
             for diff_module, ar_module in twin_pairs:
                 _copy_module_params(diff_module, ar_module)
             delta_net.dt_bias_diff.copy_(delta_net.dt_bias)
