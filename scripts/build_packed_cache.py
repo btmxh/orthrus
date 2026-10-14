@@ -1,7 +1,7 @@
 """Build the packed training cache: `messages` rows -> `input_ids` + `assistant_mask`.
 
     python scripts/build_packed_cache.py --dataset-path data/sft.jsonl \
-      --out data/processed/orthrus-packed-4096-asst
+      --out data/processed/orthrus-packed-2048-asst
 """
 
 from __future__ import annotations
@@ -28,7 +28,8 @@ def parse_args():
     parser.add_argument("--model-dir", type=str,
                         default="pretrained-models/orthrus-qwen3_5-4b-init",
                         help="Init checkpoint to take the tokenizer from.")
-    parser.add_argument("--seq-len", type=int, default=4096)
+    parser.add_argument("--seq-len", type=int, default=2048,
+                        help="Packed row length; the paper uses L=2048.")
     parser.add_argument("--num-proc", type=int, default=16)
     parser.add_argument("--max-samples", type=int, default=None,
                         help="Cap input conversations. Use a few thousand for a smoke build.")

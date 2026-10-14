@@ -327,6 +327,7 @@ def train(args):
 
 
 def parse_args():
+    # Defaults follow the paper's training setup (arXiv 2605.12825, Appendix A, Table 4).
     p = argparse.ArgumentParser(description="Train Orthrus-Qwen3.5 (dual-view diffusion).")
     # Data
     p.add_argument("--packed-cache-path", type=str, required=True,
@@ -348,17 +349,18 @@ def parse_args():
                    help="Flash attention ONLY, it builds the AR K/V cache the diffusion. "
                         "The diffusion pass uses flex attention regardless.")
     # Training
-    p.add_argument("--seq-len", type=int, default=4096)
+    p.add_argument("--seq-len", type=int, default=2048)
     p.add_argument("--micro-batch-size", type=int, default=1)
-    p.add_argument("--grad-accum-steps", type=int, default=2)
-    p.add_argument("--epochs", type=int, default=4)
+    p.add_argument("--grad-accum-steps", type=int, default=16,
+                   help="Paper: 16 x 8 GPUs x micro-batch 1 = global batch 128.")
+    p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--max-steps", type=int, default=0, help="0 = run full epochs")
     p.add_argument("--num-anchor-blocks", type=int, default=256,
                    help="Draft-block anchors sampled per sequence. Bounded by "
                         "seq_len - block_size; supervised positions per row are "
                         "num_anchor_blocks x (block_size - 1).")
     p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--warmup-ratio", type=float, default=0.02)
+    p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--max-grad-norm", type=float, default=1.0, help="0 disables clipping.")
     p.add_argument("--dtype", type=str, default="bfloat16",
