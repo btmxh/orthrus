@@ -282,7 +282,7 @@ def check_inference(final_dir: str, cache_dir: str, init_dir: str) -> None:
     import torch
     from transformers import AutoTokenizer
 
-    from src.models.generation_qwen3_5 import HybridCache
+    from src.models.generation_qwen3_5 import HybridCache, MTPCache
     from src.models.modeling_orthrus_qwen3_5 import OrthrusQwen3_5ForCausalLM
 
     tokenizer = AutoTokenizer.from_pretrained(final_dir)
@@ -308,20 +308,49 @@ def check_inference(final_dir: str, cache_dir: str, init_dir: str) -> None:
     with torch.inference_mode():
         # Generation cache vs full recompute, across a partial commit (rejected drafts must
         # not reach the delta-net state or the attention K/V).
+        # The MTP cache is driven as generate() drives it: extended with each commit's
+        # post-norm AR states and the token after each committed position.
+        mtp_cache = MTPCache(model) if model.mtp is not None else None
         cache = HybridCache(model)
-        logits = model.lm_head(inner.forward_cached(text[:, :300], cache))
+        hidden = inner.forward_cached(text[:, :300], cache)
         cache.commit(300)
-        expect_close("cache: prefill vs full", rel_err(logits, full_logits(text[:, :300])))
-        inner.forward_cached(text[:, 300:316], cache)
+        expect_close("cache: prefill vs full",
+                     rel_err(model.lm_head(hidden), full_logits(text[:, :300])))
+        if mtp_cache:
+            mtp_cache.extend(hidden, text[:, 1:301])
+        hidden = inner.forward_cached(text[:, 300:316], cache)
         cache.commit(5)                                        # 11 tokens rolled back
-        logits = model.lm_head(inner.forward_cached(text[:, 340:356], cache))
+        if mtp_cache:
+            mtp_cache.extend(hidden[:, :5], torch.cat([text[:, 301:305], text[:, 340:341]], 1))
+        hidden = inner.forward_cached(text[:, 340:356], cache)
         cache.commit(16)
+        if mtp_cache:
+            mtp_cache.extend(hidden, torch.cat([text[:, 341:356], text[:, 360:361]], 1))
         ref = full_logits(torch.cat([text[:, :305], text[:, 340:356]], dim=1))[:, 305:]
-        expect_close("cache: after partial commit vs full", rel_err(logits, ref))
+        expect_close("cache: after partial commit vs full", rel_err(model.lm_head(hidden), ref))
         prefix = torch.cat([text[:, :305], text[:, 340:356], text[:, 360:361]], dim=1)
+        seeds, seed_fn = None, None
+        if mtp_cache:
+            # Step-1 state at the last committed position vs a full uncached MTP pass.
+            post_norm = inner(input_ids=prefix).last_hidden_state
+            embeds = inner.embed_tokens(prefix[:, 1:])
+            positions = torch.arange(prefix.shape[1] - 1, device="cuda").unsqueeze(0)
+            full_step1, _ = model.mtp.step(embeds, post_norm[:, :-1], inner._rope(embeds, positions))
+            expect_close("MTP cache: step-1 state vs full",
+                         rel_err(mtp_cache.last_hidden, full_step1[:, -1:]))
+            num_seeds = min(model.config.mtp_seed_tokens, block_size - 1)
+            seeds = mtp_cache.seeds(num_seeds)
+            anchor_at = torch.tensor([[prefix.shape[1] - 1]], device="cuda")
+            ref_seeds = model.mtp.seed_tokens(post_norm, prefix, anchor_at, num_seeds,
+                                              inner.embed_tokens, model.lm_head, inner._rope)
+            log(f"  MTP cache: seeds {seeds[0, 0].tolist()} vs uncached {ref_seeds[0, 0].tolist()}")
+            if not torch.equal(seeds, ref_seeds):
+                failures.append("MTP cache seeds differ from uncached seed_tokens")
+            seed_fn = model._mtp_seeds
         expect_close("cache: diffusion draft vs uncached",
-                     rel_err(inner.diffusion_draft(text[:, 360:361], cache, block_size),
-                             inner.diffusion_block_forward(prefix)))
+                     rel_err(inner.diffusion_draft(text[:, 360:361], cache, block_size,
+                                                   seed_tokens=seeds),
+                             inner.diffusion_block_forward(prefix, seed_fn=seed_fn)))
 
         # Lossless greedy decoding: every generated token must be the argmax of a full
         # recompute up to bf16 ties (exact equality with plain AR decoding is too strict:
@@ -336,15 +365,6 @@ def check_inference(final_dir: str, cache_dir: str, init_dir: str) -> None:
         ).cuda().eval()
         for name, candidate in (("final", model), ("init", init_model)):
             for use_diffusion in (False, True):
-                if use_diffusion and candidate.mtp is not None:
-                    try:
-                        candidate.generate(prompt, max_new_tokens=8)
-                    except NotImplementedError:
-                        log(f"  greedy generate ({name}, diffusion=True): refuses MTP models "
-                            f"(not supported yet), as expected")
-                        continue
-                    failures.append(f"{name}: generate() drafted without MTP seeds")
-                    continue
                 out, stats = candidate.generate(prompt, max_new_tokens=96, return_stats=True,
                                                 use_diffusion_mode=use_diffusion)
                 hidden = candidate.model(input_ids=out).last_hidden_state.float()
@@ -357,12 +377,9 @@ def check_inference(final_dir: str, cache_dir: str, init_dir: str) -> None:
                 if gap > 0.5:
                     failures.append(f"{name}: generated token {gap:.3f} logits below argmax")
         del init_model
-        use_diffusion = model.mtp is None              # MTP models: generate() refuses diffusion
-        out = model.generate(prompt, max_new_tokens=64, temperature=0.8,
-                             use_diffusion_mode=use_diffusion)
+        out = model.generate(prompt, max_new_tokens=64, temperature=0.8)
         assert out.shape[1] > prompt.shape[1] and (out[0] < model.config.vocab_size).all()
-        log(f"  sampled generate (T=0.8, diffusion={use_diffusion}): "
-            f"{out.shape[1] - prompt.shape[1]} tokens")
+        log(f"  sampled generate (T=0.8): {out.shape[1] - prompt.shape[1]} tokens")
 
         diff_logits, block_tokens = model(input_ids=prompt, diffusion_train=False,
                                           is_diffusion_pass=True, return_block_tokens=True)

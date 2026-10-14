@@ -31,6 +31,55 @@ class HybridCache:
         self.length += num_tokens
 
 
+class MTPCache:
+    """Step-1 K/V of the frozen MTP head over the committed prefix: position p reads
+    (post-norm AR hidden h_p, token x_{p+1}), so with T committed tokens it covers p < T
+    using the anchor x_T. `last_hidden` is the step-1 output at p = T-1, which drafts x_{T+1}
+    and starts each chain -- the same state training's seed_tokens uses at anchor T."""
+
+    def __init__(self, model):
+        self.model = model
+        self.keys = self.values = self.last_hidden = None
+        self.length = 0
+
+    def extend(self, ar_hidden, next_tokens):
+        """ar_hidden (1, L, H): post-norm AR states of the L newly committed positions;
+        next_tokens (1, L): the token after each (the last one is the new anchor)."""
+        inner, mtp = self.model.model, self.model.mtp
+        seq_len = next_tokens.shape[1]
+        embeds = inner.embed_tokens(next_tokens)
+        positions = torch.arange(self.length, self.length + seq_len,
+                                 device=next_tokens.device).unsqueeze(0)
+        rope = inner._rope(embeds, positions)
+        if self.keys is None:
+            out, (keys, values) = mtp.step(embeds, ar_hidden, rope)
+        else:
+            # SDPA's is_causal is top-left aligned when keys outnumber queries, so build
+            # the mask: the whole cached prefix, then causal over the new positions.
+            mask = torch.cat([
+                torch.ones(seq_len, self.length, dtype=torch.bool, device=embeds.device),
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=embeds.device).tril(),
+            ], dim=-1)[None, None]
+            out, (keys, values) = mtp.step(
+                embeds, ar_hidden, rope, prefix_kv=(self.keys, self.values), attn_mask=mask
+            )
+            keys = torch.cat([self.keys, keys], dim=2)
+            values = torch.cat([self.values, values], dim=2)
+        self.keys, self.values = keys, values
+        self.last_hidden = out[:, -1:]
+        self.length += seq_len
+
+    def seeds(self, num_seeds):
+        """Greedy MTP drafts for the num_seeds tokens after the anchor: (1, 1, num_seeds)."""
+        inner = self.model.model
+        anchors = torch.tensor([[self.length]], device=self.keys.device)
+        visible = torch.ones(1, 1, self.length, dtype=torch.bool, device=self.keys.device)
+        return self.model.mtp.chain(
+            self.last_hidden, anchors, num_seeds, (self.keys, self.values), visible,
+            inner.embed_tokens, self.model.lm_head, inner._rope,
+        )
+
+
 def _sample(logits, temperature, top_k, top_p):
     if temperature < 1e-5:
         return logits.argmax(dim=-1), None
@@ -68,13 +117,6 @@ def generate(
     with `accepted`: drafts accepted per verification step (all 0 without diffusion)."""
     if input_ids.shape[0] != 1:
         raise ValueError("generate is batch-1.")
-    if use_diffusion_mode and getattr(model, "mtp", None) is not None:
-        # Training seeds block slots 1..k with MTP drafts; diffusion_draft does not yet,
-        # so drafting here would silently run the drafter off its training distribution.
-        raise NotImplementedError(
-            "generate() does not pre-draft with MTP yet (config.mtp_seed_tokens > 0); "
-            "use use_diffusion_mode=False or the uncached forward(is_diffusion_pass=True)."
-        )
     if (max_new_tokens is None) == (max_length is None):
         raise ValueError("Pass exactly one of max_new_tokens / max_length.")
     eos_token_id = eos_token_id if eos_token_id is not None else model.config.eos_token_id
@@ -101,6 +143,10 @@ def generate(
     hidden = inner.forward_cached(input_ids, cache)
     cache.commit(prompt_len)
     next_token, _ = _sample(model.lm_head(hidden[:, -1]).float(), temperature, top_k, top_p)
+    # MTP pre-drafting (as in training): blocks are [anchor, MTP drafts..., MASK...].
+    mtp_cache = MTPCache(model) if use_diffusion_mode and model.mtp is not None else None
+    if mtp_cache is not None:
+        mtp_cache.extend(hidden, torch.cat([input_ids[:, 1:], next_token.view(1, 1)], dim=1))
     start_idx = prompt_len
     output_ids[:, start_idx] = next_token
     if streamer:
@@ -114,7 +160,11 @@ def generate(
         diff_len = min(block_size, max_length - start_idx)
         anchor = output_ids[:, start_idx : start_idx + 1]
         if diff_len > 1:
-            draft_hidden = inner.diffusion_draft(anchor, cache, diff_len)
+            # The diffusion view's predictions are proposed for every slot; MTP drafts
+            # only condition it, as in training.
+            num_seeds = min(model.config.mtp_seed_tokens, diff_len - 1)
+            seeds = mtp_cache.seeds(num_seeds) if mtp_cache is not None and num_seeds else None
+            draft_hidden = inner.diffusion_draft(anchor, cache, diff_len, seed_tokens=seeds)
             draft_logits = model.lm_head(draft_hidden[:, :-1]).float()
             draft_tokens, draft_probs = _sample(draft_logits, temperature, top_k, top_p)
         else:
@@ -164,6 +214,9 @@ def generate(
             return finish(output_ids[:, : start_idx + eos_offset + 1])
 
         cache.commit(acceptance_len + 1)
+        if mtp_cache is not None:
+            mtp_cache.extend(ar_hidden[:, : acceptance_len + 1],
+                             torch.cat([accepted[:, 1:], next_token.view(1, 1)], dim=1))
         end_idx = start_idx + acceptance_len + 1
         output_ids[:, start_idx:end_idx] = accepted
         if streamer and acceptance_len > 0:

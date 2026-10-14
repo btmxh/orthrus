@@ -866,7 +866,7 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
             )
         return self.norm(hidden)
 
-    def diffusion_draft(self, anchor_ids, cache, diff_len):
+    def diffusion_draft(self, anchor_ids, cache, diff_len, seed_tokens=None):
         """Diffusion view over [anchor, MASK x (diff_len - 1)] at position cache.length,
         reading the committed prefix from the cache: attention K/V, and for the delta-net
         the prefix state and conv left-context (what ar_prefix_states computes in training)."""
@@ -877,6 +877,8 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
             (1, 1, diff_len), self.mask_token_id, dtype=torch.long, device=device
         )
         block_tokens[:, :, 0] = anchor_ids
+        if seed_tokens is not None:                         # (1, 1, k) MTP drafts
+            block_tokens[:, :, 1 : 1 + seed_tokens.shape[-1]] = seed_tokens
         hidden = self.embed_tokens(block_tokens)
         block_pos_emb = self._block_rope(hidden.reshape(1, diff_len, -1), anchors, diff_len)
         for layer in self.layers:

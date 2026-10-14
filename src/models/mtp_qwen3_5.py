@@ -105,32 +105,38 @@ class Qwen3_5MTP(nn.Module):
     def seed_tokens(self, ar_hidden, input_ids, anchors, num_seeds, embed_tokens, lm_head,
                     rope):
         """Greedy MTP drafts for the `num_seeds` tokens after each anchor: (B, A, num_seeds).
+        `ar_hidden` is the AR view's last hidden state after the final norm.
 
         Step 1 runs causally over the row: position p reads (h_p, x_{p+1}) and predicts
         x_{p+2}, so anchor a takes p = a-1 and drafts x_{a+1} -- from state the AR pass
-        already has when the anchor token arrives. Step j >= 2 is a query per anchor at
-        position a+j-2 reading (previous step's output, previous draft); it attends to
-        step-1 keys at p < a plus its own chain, as in incremental MTP decoding.
+        already has when the anchor token arrives. Steps >= 2: see `chain`.
         """
-        batch_size, seq_len, _ = ar_hidden.shape
-        num_anchors = anchors.shape[1]
-        device = ar_hidden.device
-
+        seq_len = ar_hidden.shape[1]
         token_embeds = embed_tokens(input_ids[:, 1:])
-        positions = torch.arange(seq_len - 1, device=device).expand(batch_size, -1)
-        out, (prefix_keys, prefix_values) = self.step(
-            token_embeds, ar_hidden[:, :-1], rope(token_embeds, positions)
-        )
+        positions = torch.arange(seq_len - 1, device=ar_hidden.device).expand(ar_hidden.shape[0], -1)
+        out, prefix_kv = self.step(token_embeds, ar_hidden[:, :-1], rope(token_embeds, positions))
         hidden = torch.gather(
             out, 1, (anchors - 1).unsqueeze(-1).expand(-1, -1, out.shape[-1])
         )                                                            # (B, A, H)
-        drafts = [lm_head(hidden).argmax(dim=-1)]
-
         # Step-1 keys visible to each anchor's chain: positions p < a.
         prefix_visible = (
-            torch.arange(seq_len - 1, device=device).view(1, 1, -1) < anchors.unsqueeze(-1)
+            torch.arange(seq_len - 1, device=ar_hidden.device).view(1, 1, -1)
+            < anchors.unsqueeze(-1)
         )                                                            # (B, A, S-1)
-        same_anchor = torch.eye(num_anchors, dtype=torch.bool, device=device)
+        return self.chain(hidden, anchors, num_seeds, prefix_kv, prefix_visible,
+                          embed_tokens, lm_head, rope)
+
+    @torch.no_grad()
+    def chain(self, hidden, anchors, num_seeds, prefix_kv, prefix_visible, embed_tokens,
+              lm_head, rope):
+        """Drafts from each anchor's step-1 output `hidden` (B, A, H). Step j >= 2 is a query
+        per anchor at position a+j-2 reading (previous step's output, previous draft); it
+        attends to the step-1 keys `prefix_kv` where `prefix_visible` (B, A, P) plus its own
+        chain, as in incremental MTP decoding."""
+        batch_size, num_anchors, _ = hidden.shape
+        prefix_keys, prefix_values = prefix_kv
+        same_anchor = torch.eye(num_anchors, dtype=torch.bool, device=hidden.device)
+        drafts = [lm_head(hidden).argmax(dim=-1)]
         chain_keys, chain_values = [], []
         for step in range(2, num_seeds + 1):
             step_embeds = embed_tokens(drafts[-1])
@@ -139,13 +145,13 @@ class Qwen3_5MTP(nn.Module):
             attn_mask = torch.cat([
                 prefix_visible,
                 same_anchor.repeat(1, step - 1).unsqueeze(0).expand(batch_size, -1, -1),
-            ], dim=-1).unsqueeze(1)                                  # (B, 1, A, S-1+A*(step-1))
-            prefix_kv = (
+            ], dim=-1).unsqueeze(1)                                  # (B, 1, A, P+A*(step-1))
+            step_kv = (
                 torch.cat([prefix_keys, *chain_keys], dim=2),
                 torch.cat([prefix_values, *chain_values], dim=2),
             )
             hidden, (step_keys, step_values) = self.step(
-                step_embeds, hidden, rope(step_embeds, anchors + step - 2), prefix_kv, attn_mask
+                step_embeds, hidden, rope(step_embeds, anchors + step - 2), step_kv, attn_mask
             )
             chain_keys.append(step_keys)
             chain_values.append(step_values)
