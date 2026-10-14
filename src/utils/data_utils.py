@@ -128,7 +128,7 @@ def build_packed_cache(
     dataset_path,
     tokenizer,
     save_path: str,
-    seq_len: int = 4096,
+    seq_len: int = 2048,
     num_proc: int = 16,
     max_samples: int | None = None,
     group_batch_size: int = 4096,
