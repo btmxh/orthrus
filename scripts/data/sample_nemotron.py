@@ -1,6 +1,7 @@
 """Step 1/3 of the paper's data pipeline (Appendix A): sample prompts from
 Nemotron-Post-Training-Dataset-v2 at chat:math:code = 1:1:1 and write them as vLLM batch
-requests, so the frozen AR model regenerates every response.
+requests, so the frozen AR model regenerates every response. Each domain contributes as
+many prompts as the smallest one has usable (code, ~175K), unless --per-domain caps it.
 
     python scripts/data/sample_nemotron.py --model Qwen/Qwen3.5-4B --out data/nemotron
     sbatch scripts/data/regenerate.sbatch                      # step 2: vLLM, one shard per GPU
@@ -26,13 +27,17 @@ REASONING_TOGGLES = {"detailed thinking on", "detailed thinking off", "/think", 
 
 
 def load_domain(source: str, domain: str):
-    """A Hub dataset id, or a local directory laid out like the repo (data/<domain>-*.parquet)."""
+    """A Hub dataset id, or a local directory laid out like the repo (data/<domain>-*.parquet).
+    data_files restricts the download to this split: load_dataset(repo, split=...) alone
+    prepares every split, including ~38 GB of multilingual data."""
     if os.path.isdir(source):
         files = sorted(glob.glob(os.path.join(source, "data", f"{domain}-*.parquet")))
         if not files:
             raise FileNotFoundError(f"no data/{domain}-*.parquet under {source}")
         return datasets.load_dataset("parquet", data_files=files, split="train")
-    return datasets.load_dataset(source, split=domain)
+    return datasets.load_dataset(
+        source, data_files={domain: f"data/{domain}-*.parquet"}, split=domain
+    )
 
 
 def single_turn_prompt(messages) -> list[dict] | None:
@@ -58,8 +63,8 @@ def parse_args():
     p.add_argument("--source", default="nvidia/Nemotron-Post-Training-Dataset-v2",
                    help="Hub dataset id, or a local dir with data/<domain>-*.parquet.")
     p.add_argument("--domains", default="chat,math,code")
-    p.add_argument("--per-domain", type=int, default=200_000,
-                   help="Prompts per domain (paper: 600K examples, 1:1:1).")
+    p.add_argument("--per-domain", type=int, default=None,
+                   help="Cap on prompts per domain. Default: the smallest domain's count.")
     p.add_argument("--model", required=True,
                    help="The frozen AR base, as vLLM will serve it (e.g. Qwen/Qwen3.5-4B).")
     p.add_argument("--max-tokens", type=int, default=4096)
@@ -70,6 +75,7 @@ def parse_args():
     p.add_argument("--enable-thinking", action="store_true",
                    help="Let the model think (Qwen chat_template_kwargs). Off by default.")
     p.add_argument("--num-shards", type=int, default=4, help="One per GPU for regenerate.sbatch.")
+    p.add_argument("--num-proc", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", required=True)
     return p.parse_args()
@@ -77,15 +83,30 @@ def parse_args():
 
 def main():
     args = parse_args()
-    requests = []
+    # Usable prompts per domain, in a seeded random order; every domain then contributes
+    # the same number -- the smallest domain's count -- so the mix is exactly 1:1:1.
+    def extract(batch):
+        found = (single_turn_prompt(messages) for messages in batch["messages"])
+        return {"prompt": [json.dumps(p, ensure_ascii=False) if p else "" for p in found]}
+
+    prompts = {}
     for domain in args.domains.split(","):
-        dataset = load_domain(args.source, domain).shuffle(seed=args.seed)
-        kept = skipped = 0
-        for row in dataset:
-            prompt = single_turn_prompt(row["messages"])
-            if prompt is None:
-                skipped += 1
-                continue
+        dataset = load_domain(args.source, domain).select_columns(["messages"])
+        # Arrow-side and parallel: only the prompts (not the long responses) reach Python.
+        dataset = dataset.shuffle(seed=args.seed).map(
+            extract, batched=True, remove_columns=["messages"], num_proc=args.num_proc,
+            desc=f"Extracting {domain} prompts",
+        )
+        prompts[domain] = [json.loads(p) for p in dataset["prompt"] if p]
+        print(f"{domain}: {len(prompts[domain]):,} usable prompts of {len(dataset):,} rows")
+    per_domain = min(len(found) for found in prompts.values())
+    if args.per_domain is not None:
+        per_domain = min(per_domain, args.per_domain)
+    print(f"taking {per_domain:,} prompts per domain")
+
+    requests = []
+    for domain, found in prompts.items():
+        for index, prompt in enumerate(found[:per_domain]):
             body = {
                 "model": args.model,
                 "messages": prompt,
@@ -95,14 +116,8 @@ def main():
                 "top_k": args.top_k,
                 "chat_template_kwargs": {"enable_thinking": args.enable_thinking},
             }
-            requests.append({"custom_id": f"{domain}-{kept:07d}", "method": "POST",
+            requests.append({"custom_id": f"{domain}-{index:07d}", "method": "POST",
                              "url": "/v1/chat/completions", "body": body})
-            kept += 1
-            if kept == args.per_domain:
-                break
-        print(f"{domain}: {kept:,} prompts ({skipped:,} rows skipped, {len(dataset):,} in split)")
-        if kept < args.per_domain:
-            print(f"WARNING: {domain} has only {kept:,} usable prompts; domains are unbalanced.")
 
     # Shuffle across domains so every shard (GPU) gets the same mix and length profile.
     random.Random(args.seed).shuffle(requests)
