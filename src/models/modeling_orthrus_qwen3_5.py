@@ -110,6 +110,14 @@ def build_diffusion_block_mask(
 FLASH_ATTENTION_IMPLS = ("flash_attention_2", "flash_attention_3", "flash_attention_4")
 
 
+def is_flash_attention(impl: str) -> bool:
+    # Without the flash_attn package, transformers swaps in the equivalent hub
+    # kernel, e.g. flash_attention_2 -> kernels-community/flash-attn2.
+    return impl in FLASH_ATTENTION_IMPLS or (
+        impl.startswith("kernels-community/") and "flash-attn" in impl
+    )
+
+
 class OrthrusQwen3_5Attention(nn.Module):
     """Qwen3.5 Full Attention, with a frozen AR view and a trainable diffusion twin."""
 
@@ -608,7 +616,7 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
         num_anchors = anchors.shape[1]
 
         impl = self.config._attn_implementation
-        if impl not in FLASH_ATTENTION_IMPLS:
+        if not is_flash_attention(impl):
             raise ValueError(
                 f"Orthrus training requires flash attention for the AR pass "
                 f"({', '.join(FLASH_ATTENTION_IMPLS)}), got _attn_implementation={impl!r}. "
@@ -673,7 +681,7 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
         # Generation: the AR pass is a full-row recompute (q_len == kv_len), so flash's
         # implicit is_causal is well-defined. eager would not mask at all.
         impl = self.config._attn_implementation
-        if impl not in FLASH_ATTENTION_IMPLS:
+        if not is_flash_attention(impl):
             raise ValueError(
                 f"Generation requires flash attention for the AR pass "
                 f"({', '.join(FLASH_ATTENTION_IMPLS)}), got _attn_implementation={impl!r}."
