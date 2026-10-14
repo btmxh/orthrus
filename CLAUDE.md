@@ -65,6 +65,6 @@ They share concepts but no code:
      --packed-cache-path data/processed/orthrus-packed-4096-asst --output-dir checkpoints --fsdp2 --auto-resume
    ```
    For a quick check, add `--max-steps N --save-every 0`. SLURM launcher: `sbatch scripts/submit_train.sbatch` (env overrides: `STEPS`, `OUT_DIR`).
-   Checkpoints go to `<output-dir>/step-N/` (HF weights plus `trainer_state.pt`) and `final/`. `--auto-resume` picks the newest `step-*`. If `world_size` or `grad_accum` changed since the checkpoint, the run restarts the epoch from batch 0 but keeps step and LR.
+   `<output-dir>/step-N/` holds only the trainable twins (`diff_weights.safetensors`, fp32) plus `trainer_state.pt`. Resuming rebuilds the frozen backbone from `--model-dir`, so pass the same `--model-dir` (the twins file records it, and a mismatch logs a warning). `final/` is a full HF model. `--auto-resume` picks the newest complete `step-*`. If `world_size` or `grad_accum` changed since the checkpoint, the run restarts the epoch from batch 0 but keeps step and LR.
 
 `data/`, `pretrained-models/`, `checkpoints/`, `wandb/` and `slurm-logs/` are gitignored.

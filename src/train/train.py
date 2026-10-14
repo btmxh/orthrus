@@ -32,6 +32,7 @@ from src.models.modeling_orthrus_qwen3_5 import (
 )
 from src.train.checkpoint import (
     latest_checkpoint_dir,
+    load_diff_weights,
     load_trainer_state,
     resume_batch_idx_is_valid,
     save_checkpoint,
@@ -85,30 +86,32 @@ def train(args):
     )
     if resume_dir is not None and not os.path.isdir(resume_dir):
         raise FileNotFoundError(f"--resume-from does not exist: {resume_dir}")
-    weights_dir = resume_dir or args.model_dir
     if resume_dir:
         log_main(is_main, f"Resuming from {resume_dir}")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
 
-    cfg = OrthrusQwen3_5Config.from_pretrained(weights_dir)
+    cfg = OrthrusQwen3_5Config.from_pretrained(args.model_dir)
     cfg.use_cache = False
     cfg._attn_implementation = args.attn_implementation
     if cfg.block_size is None or cfg.mask_token_id is None:
         raise ValueError(
-            f"{weights_dir}/config.json is missing block_size or mask_token_id; build the "
+            f"{args.model_dir}/config.json is missing block_size or mask_token_id; build the "
             f"init checkpoint with `python -m src.utils.init_model`."
         )
     # Load in fp32 so the trainable twins keep fp32 master weights (bf16 rounds away small
     # AdamW updates); only the frozen params drop to --dtype. Twins are warm-started from
     # the AR weights by init_model, so a trained --model-dir keeps its twins.
     model = OrthrusQwen3_5ForCausalLM.from_pretrained(
-        weights_dir, config=cfg, dtype=torch.float32
+        args.model_dir, config=cfg, dtype=torch.float32
     )
     n_train, n_total = freeze_to_diffusion(model)
     for param in model.parameters():
         if not param.requires_grad:
             param.data = param.data.to(dtype)
+    if resume_dir is not None:
+        # step-* checkpoints hold only the twins; the frozen backbone is --model-dir.
+        load_diff_weights(resume_dir, model, args.model_dir, is_main)
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(
         param.numel() for param in model.parameters() if param.requires_grad
@@ -288,7 +291,6 @@ def train(args):
                     os.path.join(args.output_dir, f"step-{step}"),
                     model,
                     base_model,
-                    tokenizer,
                     optimizer,
                     scheduler,
                     step,

@@ -10,7 +10,8 @@ Builds what it needs if missing (truncated init checkpoint, small packed cache),
      anchor+-1 must NOT match, so RoPE/mask/conv/state off-by-ones are caught.
   2. Training: loss finite and decreasing.
   3. Resume: a planted partial step-* dir is skipped by --auto-resume and pruned.
-  4. Checkpoint: twins saved in fp32 and all updated; frozen weights bit-identical to init.
+  4. Checkpoint: step-* dirs hold only the twins (equal to final's at the same step); final
+     has twins in fp32, all updated, and frozen weights bit-identical to init.
   5. Inference: the final checkpoint loads and runs a full diffusion block.
 """
 
@@ -193,6 +194,17 @@ def check_checkpoint(args) -> None:
     assert not bad_dtype, f"twins not saved in fp32: {bad_dtype[:5]}"
     assert not unchanged, f"twins never updated (no gradient?): {unchanged[:5]}"
     assert not drifted, f"frozen weights changed: {drifted[:5]}"
+
+    # The last step-* (same step as final) holds exactly the twins, nothing frozen.
+    step_dir = args.out_dir / f"step-{args.steps + args.steps // 2}"
+    files = sorted(os.listdir(step_dir))
+    assert files == ["diff_weights.safetensors", "trainer_state.pt"], files
+    step_twins = load_safetensors(step_dir)
+    assert step_twins.keys() == set(twins), f"step twins differ: {step_twins.keys() ^ set(twins)}"
+    mismatched = [k for k in twins if not torch.equal(step_twins[k], final[k])]
+    assert not mismatched, f"step-* twins != final twins: {mismatched[:5]}"
+    size_mb = (step_dir / "diff_weights.safetensors").stat().st_size / 2**20
+    log(f"  {step_dir.name}: twins only ({size_mb:.0f} MB), identical to final")
 
 
 def check_inference(final_dir: str) -> None:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shutil
@@ -15,10 +16,14 @@ from torch.distributed.checkpoint.state_dict import (
     get_optimizer_state_dict,
     set_optimizer_state_dict,
 )
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 from src.utils.logging import log_main
 
 TRAINER_STATE_FILE = "trainer_state.pt"
+# step-* checkpoints hold only the trainable twins; the frozen backbone is --model-dir.
+DIFF_WEIGHTS_FILE = "diff_weights.safetensors"
 
 
 def _step_dirs(output_dir: str) -> tuple[list[tuple[int, str]], list[str]]:
@@ -137,7 +142,6 @@ def save_checkpoint(
     save_dir,
     model,
     base_model,
-    tokenizer,
     optimizer,
     scheduler,
     step: int,
@@ -148,37 +152,57 @@ def save_checkpoint(
     is_main: bool,
 ):
     if args.fsdp2 and distributed:
-        full_state = get_model_state_dict(
-            model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+        # Frozen params are dropped before the all-gather, so only the twins are gathered.
+        diff_state = get_model_state_dict(
+            model, options=StateDictOptions(
+                full_state_dict=True, cpu_offload=True, ignore_frozen_params=True
+            ),
         )
-        if is_main:
-            os.makedirs(save_dir, exist_ok=True)
-            base_model.save_pretrained(save_dir, state_dict=full_state)
-            tokenizer.save_pretrained(save_dir)
-        save_trainer_state(save_dir, model, optimizer, scheduler, step, epoch, batch_idx,
-                           fsdp2=True, distributed=True, is_main=is_main,
-                           grad_accum_steps=args.grad_accum_steps)
-    elif is_main:
+    else:
+        diff_state = {
+            name: param.detach().cpu()
+            for name, param in base_model.named_parameters() if param.requires_grad
+        }
+    if is_main:
         os.makedirs(save_dir, exist_ok=True)
-        (model.module if distributed else model).save_pretrained(save_dir)
-        tokenizer.save_pretrained(save_dir)
-        save_trainer_state(
-            save_dir,
-            model,
-            optimizer,
-            scheduler,
-            step,
-            epoch,
-            batch_idx,
-            fsdp2=False,
-            distributed=distributed,
-            is_main=is_main,
-            grad_accum_steps=args.grad_accum_steps,
+        save_file(
+            {name: tensor.contiguous() for name, tensor in diff_state.items()},
+            os.path.join(save_dir, DIFF_WEIGHTS_FILE),
+            metadata={"model_dir": os.path.abspath(args.model_dir)},
         )
+    save_trainer_state(save_dir, model, optimizer, scheduler, step, epoch, batch_idx,
+                       fsdp2=args.fsdp2, distributed=distributed, is_main=is_main,
+                       grad_accum_steps=args.grad_accum_steps)
     if is_main:
         log_main(is_main, f"[checkpoint] saved to {save_dir}")
         for removed in prune_old_checkpoints(args.output_dir, args.keep_last_checkpoints):
             log_main(is_main, f"[checkpoint] pruned {removed}")
+
+
+def load_diff_weights(checkpoint_dir, model, model_dir: str, is_main: bool) -> None:
+    """Load a step-* checkpoint's twins onto a model built from --model-dir (frozen params
+    already set). Legacy full-model checkpoints also work: only their twin tensors are read."""
+    twin_names = {name for name, param in model.named_parameters() if param.requires_grad}
+    shards = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
+    if not shards:
+        raise FileNotFoundError(f"No .safetensors in {checkpoint_dir}")
+    state = {}
+    for shard in shards:
+        with safe_open(shard, framework="pt") as reader:
+            saved_model_dir = (reader.metadata() or {}).get("model_dir")
+            if saved_model_dir and saved_model_dir != os.path.abspath(model_dir):
+                log_main(is_main, f"WARNING: {checkpoint_dir} was trained on --model-dir "
+                                  f"{saved_model_dir}, resuming on {model_dir}. The frozen "
+                                  f"backbone must be the same weights.")
+            for key in reader.keys():
+                if key in twin_names:
+                    state[key] = reader.get_tensor(key)
+    missing = twin_names - state.keys()
+    if missing:
+        raise RuntimeError(
+            f"{checkpoint_dir} lacks {len(missing)} twin tensors, e.g. {sorted(missing)[:3]}"
+        )
+    model.load_state_dict(state, strict=False)
 
 
 def save_final(
