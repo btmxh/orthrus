@@ -28,7 +28,6 @@ from src.models.modeling_orthrus_qwen3_5 import (
     FLASH_ATTENTION_IMPLS,
     OrthrusQwen3_5DecoderLayer,
     OrthrusQwen3_5ForCausalLM,
-    copy_diff_from_ar,
     freeze_to_diffusion,
 )
 from src.train.checkpoint import (
@@ -100,12 +99,16 @@ def train(args):
             f"{weights_dir}/config.json is missing block_size or mask_token_id; build the "
             f"init checkpoint with `python -m src.utils.init_model`."
         )
-    model = OrthrusQwen3_5ForCausalLM.from_pretrained(weights_dir, config=cfg, dtype=dtype)
-
-    if resume_dir is None:
-        copy_diff_from_ar(model)
-        log_main(is_main, "Warm-started diffusion twins from frozen AR weights.")
+    # Load in fp32 so the trainable twins keep fp32 master weights (bf16 rounds away small
+    # AdamW updates); only the frozen params drop to --dtype. Twins are warm-started from
+    # the AR weights by init_model, so a trained --model-dir keeps its twins.
+    model = OrthrusQwen3_5ForCausalLM.from_pretrained(
+        weights_dir, config=cfg, dtype=torch.float32
+    )
     n_train, n_total = freeze_to_diffusion(model)
+    for param in model.parameters():
+        if not param.requires_grad:
+            param.data = param.data.to(dtype)
     total_params = sum(param.numel() for param in model.parameters())
     trainable_params = sum(
         param.numel() for param in model.parameters() if param.requires_grad
