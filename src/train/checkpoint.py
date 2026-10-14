@@ -21,33 +21,41 @@ from src.utils.logging import log_main
 TRAINER_STATE_FILE = "trainer_state.pt"
 
 
-def latest_checkpoint_dir(output_dir: str) -> str | None:
-    if not os.path.isdir(output_dir):
-        return None
-    best_step, best_path = -1, None
+def _step_dirs(output_dir: str) -> tuple[list[tuple[int, str]], list[str]]:
+    """(sorted complete step-* dirs, incomplete ones). trainer_state.pt is written last,
+    so a save preempted midway leaves a dir without it."""
+    complete, incomplete = [], []
     for name in os.listdir(output_dir):
         match = re.fullmatch(r"step-(\d+)", name)
         full = os.path.join(output_dir, name)
-        if match and os.path.isdir(full) and int(match.group(1)) > best_step:
-            best_step, best_path = int(match.group(1)), full
-    return best_path
+        if not (match and os.path.isdir(full)):
+            continue
+        if os.path.isfile(os.path.join(full, TRAINER_STATE_FILE)):
+            complete.append((int(match.group(1)), full))
+        else:
+            incomplete.append(full)
+    return sorted(complete), incomplete
+
+
+def latest_checkpoint_dir(output_dir: str) -> str | None:
+    """Newest complete step-*; preempted partial saves are skipped."""
+    if not os.path.isdir(output_dir):
+        return None
+    complete, _ = _step_dirs(output_dir)
+    return complete[-1][1] if complete else None
 
 
 def prune_old_checkpoints(output_dir: str, keep_last: int) -> list[str]:
+    """Keep the newest `keep_last` complete checkpoints. Partial saves are stale by the
+    time this runs (called after a save finishes), so they are removed rather than
+    counted -- otherwise a stale high-numbered one would evict every real checkpoint."""
     if keep_last <= 0:
         return []
-    step_dirs = []
-    for name in os.listdir(output_dir):
-        match = re.fullmatch(r"step-(\d+)", name)
-        full = os.path.join(output_dir, name)
-        if match and os.path.isdir(full):
-            step_dirs.append((int(match.group(1)), full))
-    step_dirs.sort()
-    removed = []
-    for _, path in step_dirs[:-keep_last] if len(step_dirs) > keep_last else []:
+    complete, incomplete = _step_dirs(output_dir)
+    stale = [path for _, path in complete[:-keep_last]] + incomplete
+    for path in stale:
         shutil.rmtree(path, ignore_errors=True)
-        removed.append(path)
-    return removed
+    return stale
 
 
 def resume_batch_idx_is_valid(saved_world, saved_grad_accum, world_size, grad_accum_steps):
@@ -77,6 +85,9 @@ def save_trainer_state(
         optim_state = optimizer.state_dict()
     if not is_main:
         return
+    # Write-then-rename so a preempted save never leaves a truncated trainer_state.pt.
+    state_path = os.path.join(save_dir, TRAINER_STATE_FILE)
+    tmp_path = state_path + ".tmp"
     torch.save(
         {
             "optimizer": optim_state,
@@ -87,8 +98,9 @@ def save_trainer_state(
             "world_size": dist.get_world_size() if distributed else 1,
             "grad_accum_steps": grad_accum_steps,
         },
-        os.path.join(save_dir, TRAINER_STATE_FILE),
+        tmp_path,
     )
+    os.replace(tmp_path, state_path)
 
 
 def load_trainer_state(
