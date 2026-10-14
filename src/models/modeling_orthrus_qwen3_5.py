@@ -44,7 +44,10 @@ DIFF_PARAM_SUFFIXES = (
 def _flex_flash_backend_available() -> bool:
     """Checks if the flash_attn.cute backend (Flash Attention 4) is available."""
     import importlib.util
-    return importlib.util.find_spec("flash_attn.cute") is not None
+    try:
+        return importlib.util.find_spec("flash_attn.cute") is not None
+    except ModuleNotFoundError:  # find_spec imports the parent; flash_attn itself is absent
+        return False
 
 
 _FLEX_FLASH_BACKEND = _flex_flash_backend_available()
