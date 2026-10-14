@@ -274,9 +274,8 @@ def check_inference(final_dir: str, cache_dir: str, init_dir: str) -> None:
                 pred = (hidden @ candidate.lm_head.weight.float().T)[0, prompt.shape[1] - 1 : -1]
                 chosen = out[0, prompt.shape[1]:]
                 gap = (pred.max(-1).values - pred.gather(-1, chosen[:, None])[:, 0]).max().item()
-                tokens_per_step = len(chosen) / (len(stats["accepted"]) + 1)
                 log(f"  greedy generate ({name}, diffusion={use_diffusion}): {len(chosen)} "
-                    f"tokens, {tokens_per_step:.2f} tok/step, max argmax gap {gap:.3f}")
+                    f"tokens, TPF {stats['tpf']:.2f}, max argmax gap {gap:.3f}")
                 if gap > 0.5:
                     failures.append(f"{name}: generated token {gap:.3f} logits below argmax")
         del init_model
