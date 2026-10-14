@@ -64,8 +64,10 @@ def generate(
     use_diffusion_mode: bool = True,
     return_stats: bool = False,
 ):
-    """input_ids: (1, prompt_len). Returns output ids (1, len), plus with return_stats a dict
-    with `accepted`: drafts accepted per verification step (all 0 without diffusion)."""
+    """input_ids: (1, prompt_len). Returns output ids (1, len), plus with return_stats a dict:
+    `accepted` (drafts accepted per verification step), `draft_passes`, `verify_passes`,
+    `generated_tokens`, and `tpf` = generated tokens / (draft + verify passes). TPF counts
+    only drafting and verifying: prefill and the MTP head are not forward passes."""
     if input_ids.shape[0] != 1:
         raise ValueError("generate is batch-1.")
     if (max_new_tokens is None) == (max_length is None):
@@ -78,11 +80,22 @@ def generate(
     # Without diffusion the same loop verifies one token at a time: plain cached AR decoding.
     block_size = model.config.block_size if use_diffusion_mode else 1
     accepted_per_step = []
+    passes = {"draft": 0, "verify": 0}
 
     def finish(output):
         if streamer:
             streamer.end()
-        return (output, {"accepted": accepted_per_step}) if return_stats else output
+        if not return_stats:
+            return output
+        generated = output.shape[1] - prompt_len
+        num_passes = passes["draft"] + passes["verify"]
+        return output, {
+            "accepted": accepted_per_step,
+            "draft_passes": passes["draft"],
+            "verify_passes": passes["verify"],
+            "generated_tokens": generated,
+            "tpf": generated / num_passes if num_passes else float("nan"),
+        }
 
     output_ids = input_ids.new_full((1, max_length), model.config.mask_token_id)
     output_ids[:, :prompt_len] = input_ids
@@ -108,6 +121,7 @@ def generate(
         anchor = output_ids[:, start_idx : start_idx + 1]
         if diff_len > 1:
             draft_hidden = inner.diffusion_draft(anchor, cache, diff_len)
+            passes["draft"] += 1
             draft_logits = model.lm_head(draft_hidden[:, :-1]).float()
             draft_tokens, draft_probs = _sample(draft_logits, temperature, top_k, top_p)
         else:
@@ -117,6 +131,7 @@ def generate(
 
         # Verify: the AR view over [anchor, drafts] from the committed prefix.
         ar_hidden = inner.forward_cached(proposed, cache)
+        passes["verify"] += 1
         ar_tokens, ar_probs = _sample(
             model.lm_head(ar_hidden).float(), temperature, top_k, top_p
         )
