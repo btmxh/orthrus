@@ -3,7 +3,7 @@ cache/
 *.egg-info/
 .venv/
 .venv
-data/
+/data/
 pretrained-models/
 checkpoints/
 wandb/
