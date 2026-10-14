@@ -68,6 +68,13 @@ def generate(
     with `accepted`: drafts accepted per verification step (all 0 without diffusion)."""
     if input_ids.shape[0] != 1:
         raise ValueError("generate is batch-1.")
+    if use_diffusion_mode and getattr(model, "mtp", None) is not None:
+        # Training seeds block slots 1..k with MTP drafts; diffusion_draft does not yet,
+        # so drafting here would silently run the drafter off its training distribution.
+        raise NotImplementedError(
+            "generate() does not pre-draft with MTP yet (config.mtp_seed_tokens > 0); "
+            "use use_diffusion_mode=False or the uncached forward(is_diffusion_pass=True)."
+        )
     if (max_new_tokens is None) == (max_length is None):
         raise ValueError("Pass exactly one of max_new_tokens / max_length.")
     eos_token_id = eos_token_id if eos_token_id is not None else model.config.eos_token_id

@@ -336,6 +336,15 @@ def check_inference(final_dir: str, cache_dir: str, init_dir: str) -> None:
         ).cuda().eval()
         for name, candidate in (("final", model), ("init", init_model)):
             for use_diffusion in (False, True):
+                if use_diffusion and candidate.mtp is not None:
+                    try:
+                        candidate.generate(prompt, max_new_tokens=8)
+                    except NotImplementedError:
+                        log(f"  greedy generate ({name}, diffusion=True): refuses MTP models "
+                            f"(not supported yet), as expected")
+                        continue
+                    failures.append(f"{name}: generate() drafted without MTP seeds")
+                    continue
                 out, stats = candidate.generate(prompt, max_new_tokens=96, return_stats=True,
                                                 use_diffusion_mode=use_diffusion)
                 hidden = candidate.model(input_ids=out).last_hidden_state.float()
@@ -348,9 +357,12 @@ def check_inference(final_dir: str, cache_dir: str, init_dir: str) -> None:
                 if gap > 0.5:
                     failures.append(f"{name}: generated token {gap:.3f} logits below argmax")
         del init_model
-        out = model.generate(prompt, max_new_tokens=64, temperature=0.8)
+        use_diffusion = model.mtp is None              # MTP models: generate() refuses diffusion
+        out = model.generate(prompt, max_new_tokens=64, temperature=0.8,
+                             use_diffusion_mode=use_diffusion)
         assert out.shape[1] > prompt.shape[1] and (out[0] < model.config.vocab_size).all()
-        log(f"  sampled generate (T=0.8): {out.shape[1] - prompt.shape[1]} tokens")
+        log(f"  sampled generate (T=0.8, diffusion={use_diffusion}): "
+            f"{out.shape[1] - prompt.shape[1]} tokens")
 
         diff_logits, block_tokens = model(input_ids=prompt, diffusion_train=False,
                                           is_diffusion_pass=True, return_block_tokens=True)
