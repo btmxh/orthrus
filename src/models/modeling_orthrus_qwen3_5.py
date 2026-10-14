@@ -28,6 +28,7 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
 from fla.modules.conv import causal_conv1d as fla_causal_conv1d
 
 from src.models.config_orthrus_qwen3_5 import OrthrusQwen3_5Config
+from src.models.generation_qwen3_5 import generate as orthrus_generate
 
 _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
 _compiled_create_block_mask = torch.compile(create_block_mask, dynamic=False)
@@ -211,6 +212,38 @@ class OrthrusQwen3_5Attention(nn.Module):
         attn_output = attn_output * torch.sigmoid(gate)
         return self.o_proj(attn_output), None
 
+    def forward_cached(self, hidden_states, position_embeddings, cache_entry):
+        """Frozen AR view over new tokens on top of cached (keys, values) of the committed
+        prefix. Returns (output, pending own (keys, values)); `commit` appends a prefix."""
+        query_states, key_states, value_states, gate, input_shape = self._qkv(
+            hidden_states, self.q_proj, self.k_proj, self.v_proj, self.q_norm, self.k_norm
+        )
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        keys, values = key_states, value_states
+        if cache_entry is not None:
+            keys = torch.cat([cache_entry[0], key_states], dim=2)
+            values = torch.cat([cache_entry[1], value_states], dim=2)
+        # q_len <= kv_len: flash's causal mask is bottom-right aligned, i.e. new token i
+        # sees the whole prefix plus new tokens <= i.
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+        attn_output, _ = attention_interface(
+            self, query_states, keys, values, None, dropout=0.0, scaling=self.scaling,
+            is_causal=True,
+        )
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = attn_output * torch.sigmoid(gate)
+        return self.o_proj(attn_output), (key_states, value_states)
+
+    @staticmethod
+    def commit(cache_entry, pending, num_tokens):
+        keys, values = (part[:, :, :num_tokens] for part in pending)
+        if cache_entry is None:
+            return keys, values
+        return torch.cat([cache_entry[0], keys], dim=2), torch.cat([cache_entry[1], values], dim=2)
+
     def diffusion_blocks(
         self,
         block_hidden_states,
@@ -365,6 +398,54 @@ class OrthrusQwen3_5GatedDeltaNet(nn.Module):
             core.reshape(-1, self.head_v_dim), gate_input.reshape(-1, self.head_v_dim)
         )
         return self.out_proj(core.reshape(batch_size, seq_len, -1))
+
+    def forward_cached(self, hidden_states, cache_entry):
+        """Frozen AR path over new tokens from the cached (recurrent state, conv lefts) of
+        the committed prefix. A rejected draft must not reach the state, so the block's
+        post-conv inputs are returned as pending and `commit` replays only the accepted
+        prefix. cache_entry=None starts from the zero state (prefill)."""
+        batch_size, seq_len, _ = hidden_states.shape
+        mixed_qkv, gate_decay, beta = self._pre_conv(
+            hidden_states, self.in_proj_qkv, self.in_proj_b, self.in_proj_a,
+            self.dt_bias, self.A_log,
+        )
+        gate_input = self.in_proj_z(hidden_states).reshape(
+            batch_size, seq_len, -1, self.head_v_dim
+        )
+        if cache_entry is None:
+            state = None
+            conv_lefts = mixed_qkv.new_zeros(batch_size, self.conv_kernel_size - 1, self.conv_dim)
+        else:
+            state, conv_lefts = cache_entry
+        query_states, key_states, value_states = self._conv_then_split(
+            torch.cat([conv_lefts, mixed_qkv], dim=1), self.conv1d, keep_len=seq_len
+        )
+        core, final_state = torch_chunk_gated_delta_rule(
+            query_states, key_states, value_states, g=gate_decay, beta=beta,
+            initial_state=state, output_final_state=True, use_qk_l2norm_in_kernel=True,
+        )
+        core = self.norm(
+            core.reshape(-1, self.head_v_dim), gate_input.reshape(-1, self.head_v_dim)
+        )
+        output = self.out_proj(core.reshape(batch_size, seq_len, -1))
+        pending = (state, conv_lefts, mixed_qkv, query_states, key_states, value_states,
+                   gate_decay, beta, final_state)
+        return output, pending
+
+    @staticmethod
+    def commit(cache_entry, pending, num_tokens):
+        (state, conv_lefts, mixed_qkv, query_states, key_states, value_states,
+         gate_decay, beta, final_state) = pending
+        if num_tokens < mixed_qkv.shape[1]:
+            accepted = slice(0, num_tokens)
+            _, final_state = torch_chunk_gated_delta_rule(
+                query_states[:, accepted], key_states[:, accepted], value_states[:, accepted],
+                g=gate_decay[:, accepted], beta=beta[:, accepted], initial_state=state,
+                output_final_state=True, use_qk_l2norm_in_kernel=True,
+            )
+        width = conv_lefts.shape[1]
+        conv_lefts = torch.cat([conv_lefts, mixed_qkv[:, :num_tokens]], dim=1)[:, -width:]
+        return final_state.float(), conv_lefts
 
     @torch.no_grad()
     def ar_prefix_states(self, ar_hidden_states, anchors):
@@ -521,6 +602,7 @@ class OrthrusQwen3_5DecoderLayer(nn.Module):
         block_pos_emb=None,
         flex_block_mask=None,
         ar_seq_len=None,        # GENERATION: anchor position; enables the mask-free path
+        gdn_seeds=None,         # GENERATION: cached (prefix state, conv lefts) for the delta-net
         **kwargs,
     ):
         residual = hidden_states
@@ -528,7 +610,8 @@ class OrthrusQwen3_5DecoderLayer(nn.Module):
 
         if diffusion_mode:
             if self.layer_type == "linear_attention":
-                seeds = self.linear_attn.ar_prefix_states(ar_context, anchors)
+                seeds = gdn_seeds if gdn_seeds is not None else \
+                    self.linear_attn.ar_prefix_states(ar_context, anchors)
                 mixed = self.linear_attn.diffusion_blocks(normed, seeds)
             else:
                 # flex_block_mask is an attention-only concept; the delta-net never sees it.
@@ -548,6 +631,18 @@ class OrthrusQwen3_5DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         return residual + self.mlp(hidden_states)
+
+
+    def forward_cached(self, hidden_states, position_embeddings, cache_entry):
+        """Frozen AR view on top of the generation cache; returns (hidden, pending)."""
+        residual = hidden_states
+        normed = self.input_layernorm(hidden_states)
+        if self.layer_type == "linear_attention":
+            mixed, pending = self.linear_attn.forward_cached(normed, cache_entry)
+        else:
+            mixed, pending = self.self_attn.forward_cached(normed, position_embeddings, cache_entry)
+        hidden_states = residual + mixed
+        return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states)), pending
 
 
 class OrthrusQwen3_5PreTrainedModel(Qwen3_5PreTrainedModel):
@@ -742,6 +837,48 @@ class OrthrusQwen3_5Model(OrthrusQwen3_5PreTrainedModel):
         return self.norm(hidden).reshape(1, block_size, -1)
 
 
+    def forward_cached(self, input_ids, cache):
+        """Frozen AR view over `input_ids`, which continue the cache's committed prefix.
+        The new tokens stay pending until `cache.commit(n)` keeps the first n."""
+        positions = torch.arange(
+            cache.length, cache.length + input_ids.shape[1], device=input_ids.device
+        ).unsqueeze(0)
+        hidden = self.embed_tokens(input_ids)
+        position_embeddings = self._rope(hidden, positions)
+        for layer in self.layers:
+            hidden, cache.pending[layer.layer_idx] = layer.forward_cached(
+                hidden, position_embeddings, cache.entries[layer.layer_idx]
+            )
+        return self.norm(hidden)
+
+    def diffusion_draft(self, anchor_ids, cache, diff_len):
+        """Diffusion view over [anchor, MASK x (diff_len - 1)] at position cache.length,
+        reading the committed prefix from the cache: attention K/V, and for the delta-net
+        the prefix state and conv left-context (what ar_prefix_states computes in training)."""
+        device = anchor_ids.device
+        anchor = cache.length
+        anchors = torch.tensor([[anchor]], dtype=torch.long, device=device)
+        block_tokens = torch.full(
+            (1, 1, diff_len), self.mask_token_id, dtype=torch.long, device=device
+        )
+        block_tokens[:, :, 0] = anchor_ids
+        hidden = self.embed_tokens(block_tokens)
+        block_pos_emb = self._block_rope(hidden.reshape(1, diff_len, -1), anchors, diff_len)
+        for layer in self.layers:
+            entry = cache.entries[layer.layer_idx]
+            linear = layer.layer_type == "linear_attention"
+            hidden = layer(
+                hidden,
+                diffusion_mode=True,
+                ar_context=None if linear else entry,
+                gdn_seeds=entry if linear else None,
+                anchors=anchors,
+                block_pos_emb=block_pos_emb,
+                ar_seq_len=anchor,
+            )
+        return self.norm(hidden).reshape(1, diff_len, -1)
+
+
 class OrthrusQwen3_5ForCausalLM(OrthrusQwen3_5PreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
@@ -799,6 +936,10 @@ class OrthrusQwen3_5ForCausalLM(OrthrusQwen3_5PreTrainedModel):
                 logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=-100
             )
         return loss, hidden, labels
+
+    def generate(self, input_ids, **kwargs):
+        """Lossless draft-and-verify decoding; see src/models/generation_qwen3_5.py."""
+        return orthrus_generate(self, input_ids, **kwargs)
 
 
 @torch.no_grad()
