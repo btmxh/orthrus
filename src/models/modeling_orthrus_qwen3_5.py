@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 from typing import Callable
 
 import torch
@@ -53,10 +54,23 @@ def _flex_flash_backend_available() -> bool:
 _FLEX_FLASH_BACKEND = _flex_flash_backend_available()
 
 
+@functools.cache
+def _small_smem_bwd_options(device_index: int) -> tuple[tuple[str, int], ...]:
+    """Smaller flex backward tiles for GPUs with <160KB smem/block (consumer Ampere/Ada):
+    the default head_dim=256 backward config exceeds their ~99KB limit. A100/H100 unaffected."""
+    smem = torch.cuda.get_device_properties(device_index).shared_memory_per_block_optin
+    if smem >= 160 * 1024:
+        return ()
+    return (("bwd_BLOCK_M1", 16), ("bwd_BLOCK_N1", 32), ("bwd_BLOCK_M2", 32),
+            ("bwd_BLOCK_N2", 16), ("bwd_num_stages", 1))
+
+
 def fused_flex_attention(query_states, key_states, value_states, mask=None):
     kernel_options = {}
     if _FLEX_FLASH_BACKEND:
         kernel_options["BACKEND"] = "FLASH"
+    if query_states.is_cuda:
+        kernel_options.update(_small_smem_bwd_options(query_states.device.index))
     if mask is not None:
         q_block_size, kv_block_size = mask.BLOCK_SIZE
         kernel_options["sparse_block_size"] = (int(q_block_size), int(kv_block_size))
