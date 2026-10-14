@@ -9,3 +9,4 @@ checkpoints/
 wandb/
 slurm-logs/
 *.log
+.direnv/
