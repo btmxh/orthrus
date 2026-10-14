@@ -4,7 +4,8 @@ requests, so the frozen AR model regenerates every response. Each domain contrib
 many prompts as the smallest one has usable (code, ~175K), unless --per-domain caps it.
 
     python scripts/data/sample_nemotron.py --model Qwen/Qwen3.5-4B --out data/nemotron
-    sbatch scripts/data/regenerate.sbatch                      # step 2: vLLM, one shard per GPU
+    scripts/data/vllm-env/.venv/bin/python scripts/data/generate_vllm.py \
+        --model Qwen/Qwen3.5-4B --dir data/nemotron              # step 2: vLLM, one shard per GPU
     python scripts/data/merge_responses.py --dir data/nemotron  # step 3: -> messages JSONL
 
 Prompts are single-turn (leading system messages + the first user turn), so every
@@ -74,7 +75,7 @@ def parse_args():
     p.add_argument("--top-k", type=int, default=-1)
     p.add_argument("--enable-thinking", action="store_true",
                    help="Let the model think (Qwen chat_template_kwargs). Off by default.")
-    p.add_argument("--num-shards", type=int, default=4, help="One per GPU for regenerate.sbatch.")
+    p.add_argument("--num-shards", type=int, default=4, help="One per GPU for generate_vllm.py.")
     p.add_argument("--num-proc", type=int, default=8)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", required=True)
