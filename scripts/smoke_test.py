@@ -4,10 +4,11 @@
     python scripts/smoke_test.py --nproc 8     # torchrun + FSDP2, e.g. on the H100 node
 
 Builds what it needs if missing (truncated init checkpoint, small packed cache), then checks:
-  1. Equivalence: at init the twins equal the AR weights, so with block_size=1 the
-     diffusion view must reproduce the AR hidden state at every anchor -- on the training
+  1. Init checks. Equivalence: at init the twins equal the AR weights, so with block_size=1
+     the diffusion view must reproduce the AR hidden state at every anchor -- on the training
      path (flex mask, chained delta-net states) and the generation path. A control at
-     anchor+-1 must NOT match, so RoPE/mask/conv/state off-by-ones are caught.
+     anchor+-1 must NOT match, so RoPE/mask/conv/state off-by-ones are caught. Then the
+     train and generation paths must agree on full blocks.
   2. Training: loss finite and decreasing.
   3. Resume: a planted partial step-* dir is skipped by --auto-resume and pruned.
   4. Checkpoint: step-* dirs hold only the twins (equal to final's at the same step); final
@@ -80,44 +81,57 @@ def check_equivalence(init_dir: str) -> None:
         init_dir, dtype=torch.bfloat16, attn_implementation="flash_attention_2"
     ).cuda().eval()
     inner = model.model
+    block_size = inner.block_size
     gen = torch.Generator(device="cuda").manual_seed(0)
     input_ids = torch.randint(0, 150000, (2, 512), device="cuda", generator=gen)
+    failures = []
 
     def min_cos(a, b):
         return F.cosine_similarity(a.float(), b.float(), dim=-1).min().item()
 
+    def expect_match(name, cos):
+        log(f"  {name}: min cos = {cos:.5f}")
+        if cos < 0.999:
+            failures.append(f"{name} (min cos {cos:.5f})")
+
     def at(hidden, positions):
         return torch.gather(hidden, 1, positions.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
 
-    failures = []
-    with torch.no_grad():
-        ar_hidden = inner(input_ids=input_ids).last_hidden_state
-
-        # >= 128 queries keeps flex off its decode kernel.
-        inner.block_size = 1
-        anchors = torch.stack([
-            torch.sort(torch.randperm(510, device="cuda", generator=gen)[:256] + 1).values
-            for _ in range(2)
+    def sorted_anchors(count, high):
+        return torch.stack([
+            torch.sort(torch.randperm(high, device="cuda", generator=gen)[:count] + 1).values
+            for _ in range(input_ids.shape[0])
         ])
+
+    with torch.no_grad():
+        # Twins == AR weights at init, so a 1-token block reproduces the AR state.
+        ar_hidden = inner(input_ids=input_ids).last_hidden_state
+        inner.block_size = 1
+        anchors = sorted_anchors(256, 510)   # >= 128 queries keeps flex off its decode kernel
         diff_hidden = inner.diffusion_train_forward(input_ids, anchors)[:, :, 0]
-        cos = min_cos(diff_hidden, at(ar_hidden, anchors))
-        log(f"  train path: min cos vs AR = {cos:.5f}")
-        if cos < 0.999:
-            failures.append(f"train path diverges from AR (min cos {cos:.5f})")
+        expect_match("train path vs AR", min_cos(diff_hidden, at(ar_hidden, anchors)))
         for shift in (-1, 1):
             shifted = (anchors + shift).clamp(0, input_ids.shape[1] - 1)
             cos = min_cos(diff_hidden, at(ar_hidden, shifted))
             log(f"  control anchor{shift:+d}: min cos = {cos:.5f} (must be low)")
             if cos > 0.9:
                 failures.append(f"control at anchor{shift:+d} matches; check has no teeth")
-
         # Short prefixes exercise the zero-padded conv left-context.
         for prefix_len in (1, 2, 3, 4, 37, 300):
             gen_hidden = inner.diffusion_block_forward(input_ids[:1, :prefix_len], diff_len=1)
-            cos = min_cos(gen_hidden[:, 0], ar_hidden[:1, prefix_len - 1])
-            log(f"  gen path prefix_len={prefix_len:3d}: min cos vs AR = {cos:.5f}")
-            if cos < 0.999:
-                failures.append(f"gen path diverges from AR at prefix_len={prefix_len}")
+            expect_match(f"gen path vs AR, prefix_len={prefix_len}",
+                         min_cos(gen_hidden[:, 0], ar_hidden[:1, prefix_len - 1]))
+        inner.block_size = block_size
+
+        # The batched training path and the generation path must agree on full blocks.
+        anchors = sorted_anchors(16, input_ids.shape[1] - block_size - 1)
+        anchors[0, 0] = 1                      # shortest prefix: zero-padded conv lefts
+        train_hidden = inner.diffusion_train_forward(input_ids, anchors)
+        for row, slot in ((0, 0), (0, 7), (1, 3), (1, 15)):
+            anchor = int(anchors[row, slot])
+            gen_hidden = inner.diffusion_block_forward(input_ids[row : row + 1, : anchor + 1])
+            expect_match(f"train vs gen path, full block at anchor {anchor}",
+                         min_cos(train_hidden[row, slot], gen_hidden[0]))
     if failures:
         raise AssertionError("; ".join(failures))
 
@@ -265,7 +279,7 @@ def main():
     args = parse_args()
     ensure_prereqs(args)
 
-    log("1/5 equivalence at init (diffusion view == AR view with block_size=1)")
+    log("1/5 init checks (AR equivalence, train-gen parity)")
     run_in_subprocess(check_equivalence, str(args.init_dir))
     log("2-3/5 training + resume")
     check_training(args)
